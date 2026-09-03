@@ -1,0 +1,205 @@
+{
+  "bone": {
+    "feed": 1,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334576"
+  },
+  "ribcage": {
+    "feed": 2,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334599"
+  },
+  "skeleton_lvl4": {
+    "feed": 140,
+    "damage": 50,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-09-01T11:06:48.377753"
+  },
+  "skeleton_lvl5": {
+    "feed": 700,
+    "damage": 225,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334622"
+  },
+  "skeleton_lvl6": {
+    "feed": 300,
+    "damage": 100,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-08-31T19:54:37.375854"
+  },
+  "zombie_lvl2": {
+    "feed": 60,
+    "damage": 25,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334638"
+  },
+  "skeleton_lvl1": {
+    "feed": 10,
+    "damage": 5,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334646"
+  },
+  "skeleton_lvl2": {
+    "feed": 25,
+    "damage": 10,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-09-02T17:12:01.049597"
+  },
+  "skeleton_lvl3": {
+    "feed": 60,
+    "damage": 25,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-09-02T19:39:02.729889"
+  },
+  "icerune_lvl3": {
+    "feed": 12,
+    "damage": null,
+    "max_level": true,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334683"
+  },
+  "poisonrune_lvl1": {
+    "feed": 2,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334813"
+  },
+  "icerune_lvl1": {
+    "feed": 2,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-08-31T15:16:17.109373"
+  },
+  "icerune_lvl2": {
+    "feed": 5,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334825"
+  },
+  "coins_lvl1": {
+    "feed": 2,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334831"
+  },
+  "coins_lvl2": {
+    "feed": 5,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334841"
+  },
+  "poisonrune_lvl2": {
+    "feed": 12,
+    "damage": 5,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334847"
+  },
+  "poisonrune_lvl3": {
+    "feed": 12,
+    "damage": null,
+    "max_level": true,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334853"
+  },
+  "skeleton_lvl7": {
+    "feed": 1500,
+    "damage": 500,
+    "max_level": true,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334983"
+  },
+  "skeleton": {
+    "feed": 60,
+    "damage": 25,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334989"
+  },
+  "manapotion_lvl3": {
+    "feed": 22,
+    "damage": null,
+    "max_level": true,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334995"
+  },
+  "coins_lvl3": {
+    "feed": 12,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.335001"
+  },
+  "manapot_lvl3": {
+    "feed": 22,
+    "damage": null,
+    "max_level": true,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.335012"
+  },
+  "necromancer": {
+    "feed": 700,
+    "damage": 225,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.335018"
+  },
+  "icerunes": {
+    "feed": 5,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.335027"
+  },
+  "rottenflesh": {
+    "feed": 1,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.335041"
+  },
+  "severedhand": {
+    "feed": 2,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.335051"
+  },
+  "zombie_lvl1": {
+    "feed": 30,
+    "damage": 10,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-08-31T20:08:10.412702"
+  },
+  "peasant": {
+    "feed": 50,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-09-02T19:23:03.293010"
+  },
+  "gems_lvl1": {
+    "feed": 2,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-09-02T19:43:12.008904"
+  }
+}

@@ -1,0 +1,32 @@
+{
+ "frame_000_a.png": {
+  "source": "bank-anchor"
+ },
+ "frame_002_a.png": {
+  "z": 2,
+  "item": "ribcage"
+ },
+ "frame_004_a.png": {
+  "z": 2,
+  "item": "ribcage"
+ },
+ "frame_006_a.png": {
+  "z": 2,
+  "item": "ribcage"
+ },
+ "frame_008_a.png": {
+  "item": "bone"
+ },
+ "frame_010_a.png": {
+  "item": "bone"
+ },
+ "frame_012_a.png": {
+  "item": "bone"
+ },
+ "frame_014_a.png": {
+  "item": "bone"
+ },
+ "frame_016_a.png": {
+  "item": "bone"
+ }
+}

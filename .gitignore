@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime logs + scratch (generated during live runs)
+session.jsonl
+llm_chats.jsonl
+stub_tmp.png
+
+# Generated debug / calibration output (re-creatable)
+assets/debug/
+assets/review/
+assets/calib/menu/
+
+# Live-screen captures (adb screencaps; the verify-suite fixture frames are
+# currently absent pending re-capture, so ignore the whole dir)
+screenshots/
+
+# macOS
+.DS_Store

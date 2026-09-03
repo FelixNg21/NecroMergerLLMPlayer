@@ -1,0 +1,38 @@
+{
+  "skeleton": {
+    "chain": [
+      "bone",
+      "ribcage",
+      "skeleton_lvl1"
+    ],
+    "source": "wiki",
+    "updated": "2026-09-02T15:30:29.057660"
+  },
+  "icerune": {
+    "chain": [
+      "icerune_lvl1",
+      "icerune_lvl2",
+      "icerune_lvl3"
+    ],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334805"
+  },
+  "poisonrune": {
+    "chain": [
+      "poisonrune_lvl1",
+      "poisonrune_lvl2",
+      "poisonrune_lvl3"
+    ],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334858"
+  },
+  "zombie": {
+    "chain": [
+      "rottenflesh",
+      "severedhand",
+      "zombie_lvl1"
+    ],
+    "source": "wiki",
+    "updated": "2026-09-02T15:30:29.059335"
+  }
+}

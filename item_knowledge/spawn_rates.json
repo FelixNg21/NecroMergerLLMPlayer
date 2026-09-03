@@ -1,0 +1,39 @@
+{
+  "icebox_unopened": {
+    "targets": [
+      "icerune_lvl1",
+      "icerune_lvl2",
+      "poisonrune_lvl1"
+    ],
+    "uses": 5,
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334967"
+  },
+  "grave_lvl1": {
+    "targets": [
+      "bone"
+    ],
+    "uses": 5,
+    "source": "popup",
+    "updated": "2026-08-31T15:35:18.757144"
+  },
+  "grave_lvl2": {
+    "targets": [
+      "bone",
+      "ribcage"
+    ],
+    "uses": null,
+    "source": "popup",
+    "updated": "2026-08-31T15:30:09.114632"
+  },
+  "grave_lvl3": {
+    "targets": [
+      "bone",
+      "ribcage",
+      "zombie"
+    ],
+    "uses": 5,
+    "source": "popup",
+    "updated": "2026-08-31T15:35:18.760069"
+  }
+}

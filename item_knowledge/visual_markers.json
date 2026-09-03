@@ -1,0 +1,245 @@
+{
+  "bone": {
+    "description": "Merge to summon a Rib Cage.",
+    "merge_edges": [
+      "two Bone -> Rib Cage",
+      "bone -> rib cage"
+    ],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334589"
+  },
+  "ribcage": {
+    "description": "Merge to summon a Skeleton.",
+    "merge_edges": [
+      "two Rib Cage -> Skeleton",
+      "ribcage -> skeleton"
+    ],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334600"
+  },
+  "skeleton_lvl4": {
+    "description": "Merge to summon a higher lvl Skeleton.",
+    "merge_edges": [
+      "two Skeleton -> Skeleton of the next level",
+      "skeleton -> skeleton"
+    ],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334612"
+  },
+  "skeleton_lvl5": {
+    "description": "Merge to summon a higher lvl Skeleton.",
+    "merge_edges": [
+      "two Skeleton -> Skeleton of the next level",
+      "skeleton -> skeleton"
+    ],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334623"
+  },
+  "skeleton_lvl6": {
+    "description": "Merge to summon a higher lvl Skeleton.",
+    "merge_edges": [
+      "two Skeleton -> Skeleton of the next level",
+      "skeleton -> skeleton"
+    ],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334632"
+  },
+  "zombie_lvl2": {
+    "description": "Merge to summon a higher lvl Skeleton.",
+    "merge_edges": [
+      "two Skeleton -> Skeleton of the next level",
+      "zombie -> skeleton"
+    ],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334640"
+  },
+  "skeleton_lvl1": {
+    "description": "Merge to summon a higher lvl Skeleton.",
+    "merge_edges": [
+      "two Skeleton -> Skeleton of the next level",
+      "skeleton -> skeleton"
+    ],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334647"
+  },
+  "skeleton_lvl2": {
+    "description": "Merge to summon a higher lvl Skeleton.",
+    "merge_edges": [
+      "two Skeleton -> Skeleton of the next level",
+      "skeleton -> skeleton"
+    ],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334661"
+  },
+  "skeleton_lvl3": {
+    "description": "Merge to summon a higher lvl Skeleton.",
+    "merge_edges": [
+      "two Skeleton -> Skeleton of the next level",
+      "skeleton -> skeleton"
+    ],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334671"
+  },
+  "icebox_unopened": {
+    "description": "Tap to open.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334676"
+  },
+  "icerune_lvl3": {
+    "description": "Feed to the Devourer.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334684"
+  },
+  "poisonrune_lvl1": {
+    "description": "Merge to create a bigger pile or feed to the Devourer.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334814"
+  },
+  "icerune_lvl1": {
+    "description": "Merge to create a bigger pile or feed to the Devourer.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T15:16:17.108087"
+  },
+  "icerune_lvl2": {
+    "description": "Merge to create a bigger pile or feed to the Devourer.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334826"
+  },
+  "coins_lvl1": {
+    "description": "Merge to create a bigger pile or feed to the Devourer.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334832"
+  },
+  "valuablechest": {
+    "description": "Tap to spawn items.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334836"
+  },
+  "coins_lvl2": {
+    "description": "Merge to create a bigger pile or feed to the Devourer.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334842"
+  },
+  "poisonrune_lvl2": {
+    "description": "Merge to create a bigger pile or feed to the Devourer.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334848"
+  },
+  "poisonrune_lvl3": {
+    "description": "Feed to the Devourer.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334853"
+  },
+  "skeleton_lvl7": {
+    "description": "This Skeleton is Max lvl.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334984"
+  },
+  "skeleton": {
+    "description": "Merge to summon a higher lvl Skeleton.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334990"
+  },
+  "manapotion_lvl3": {
+    "description": "Feed to the Devourer.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.334996"
+  },
+  "coins_lvl3": {
+    "description": "Merge to create a bigger pile or feed to the Devourer.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.335002"
+  },
+  "manapotion_lvl1": {
+    "description": "Increases Mana Cap. Merge to lvl up.",
+    "merge_edges": [
+      "Mana Cap +2000"
+    ],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.335007"
+  },
+  "manapot_lvl3": {
+    "description": "Feed to the Devourer.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.335013"
+  },
+  "necromancer": {
+    "description": "Merge to summon a higher lvl Skeleton.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.335019"
+  },
+  "icerunes": {
+    "description": "Merge to create a bigger pile or feed to the Devourer.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.335028"
+  },
+  "manapool_lvl1": {
+    "description": "Increases Mana Cap. Merge to lvl up.",
+    "merge_edges": [
+      "Mana Cap +2000"
+    ],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.335032"
+  },
+  "grave_lvl1": {
+    "description": "Spawns bone/ribcage when tapped.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T15:31:25.471181"
+  },
+  "rottenflesh": {
+    "description": "Merge to summon a Severed Hand.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.335042"
+  },
+  "grave_lvl3": {
+    "description": "Spawns bone/ribcage/zombie when tapped.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T15:31:25.474322"
+  },
+  "severedhand": {
+    "description": "Merge to summon a Zombie.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-08-31T13:22:26.335052"
+  },
+  "zombie_lvl1": {
+    "description": null,
+    "merge_edges": [
+      "zombie -> a higher lvl zombie"
+    ],
+    "source": "popup",
+    "updated": "2026-08-31T20:06:51.616853"
+  },
+  "lockedchest": {
+    "description": "Tap to watch an advert to unlock this Valuable Chest.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-09-02T18:33:36.790918"
+  },
+  "gems_lvl1": {
+    "description": "Merge to create a bigger pile or feed to the Devourer.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-09-02T19:43:12.005868"
+  }
+}

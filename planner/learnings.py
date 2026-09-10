@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from planner.atomic import atomic_write_text
 
 DEFAULT_PATH = Path("learnings.md")
 MAX_LEARNINGS = 20          # most recent learnings injected into the prompt
@@ -230,7 +231,8 @@ def read(path: Path = DEFAULT_PATH) -> list[Learning]:
 
 def write(path: Path, learnings: list[Learning]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(_to_block(l) + "\n" for l in learnings))
+    atomic_write_text(path, "".join(_to_block(l) + "\n" for l in learnings))
+
 
 
 def read_learnings(path: Path = DEFAULT_PATH,

@@ -27,6 +27,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from planner.atomic import atomic_write_text
 from planner.llm_client import LLMError
 from vision.classifier import TemplateClassifier
 from vision.grid import (
@@ -162,9 +163,9 @@ def write_board_dims(rows: int, cols: int, source: str = "detected",
             return False
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"rows": int(rows), "cols": int(cols),
-                                 "source": source,
-                                 "updated": datetime.now().isoformat()}) + "\n")
+        atomic_write_text(p, json.dumps({"rows": int(rows), "cols": int(cols),
+                                          "source": source,
+                                          "updated": datetime.now().isoformat()}) + "\n")
         return True
     except (OSError, ValueError, TypeError):
         return False

@@ -17,8 +17,8 @@ Old format (item_glossary.md): markdown blocks (DEPRECATED, kept for backward co
 """
 
 import json
-import os
 import re
+from planner.atomic import atomic_write_text
 from datetime import datetime
 from pathlib import Path
 
@@ -66,14 +66,8 @@ def _load_json(path: Path, default=None):
 def _save_json(path: Path, data: dict) -> None:
     if not isinstance(data, dict):
         raise ValueError(f"Data to save must be a dict, got {type(data)}")
-    path.parent.mkdir(parents=True, exist_ok=True)
     json_dump = json.dumps(data, indent=2)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8" ) as f:
-        f.write(json_dump)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    atomic_write_text(path, json_dump)
 
 
 def _get_knowledge_dir(path: Path) -> Path:
@@ -96,7 +90,8 @@ def _save_json_dir(knowledge_dir: Path, filename: str, data: dict) -> None:
     """Save JSON to a specific knowledge directory."""
     knowledge_dir.mkdir(parents=True, exist_ok=True)
     path = knowledge_dir / filename
-    path.write_text(json.dumps(data, indent=2))
+    json_dump = json.dumps(data, indent=2)
+    atomic_write_text(path, json_dump)
 
 
 def read_merge_chains(knowledge_dir: Path | None = None) -> dict[str, list[str]]:
@@ -594,5 +589,5 @@ def prune_glossary(path: Path = DEFAULT_PATH, names=None, protected: bool = True
             or not any(q in _norm(b) for q in queries)]
     removed = len(blocks) - len(kept)
     if removed:
-        path.write_text("\n".join(kept) + "\n")
+        atomic_write_text(path, "\n".join(kept) + "\n")
     return removed

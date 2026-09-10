@@ -1026,6 +1026,73 @@ def part_m():
           pl._craving_cache_fresh())
 
 
+def part_n():
+    """Craving-material merge guard (Sep 7): merging the last pair of the
+    EXACT craved id/level into the next level starves the craving (observed:
+    two eyemonster_lvl1 merged to lvl2, then the lvl2 fed for zero craving
+    credit). ranked_merge_groups drops the group; _validate rejects with
+    merge_craving_material. Both fire only on full knowledge (menu-read
+    level + remaining need); precursor/surplus/unknown cases pass."""
+    from planner.agent import Move
+    from planner.llm import LLMPlanner
+
+    def eye_board(n_lvl1, n_lvl2=0):
+        cells = [((0, i, "eyemonster_lvl1", 0.9)) for i in range(n_lvl1)]
+        cells += [((1, i, "eyemonster_lvl2", 0.9)) for i in range(n_lvl2)]
+        return board(cells)
+
+    # N1: last pair at craved level, need unmet -> group dropped.
+    r = ranked_merge_groups(eye_board(2), craved_item="eyemonster",
+                            craved_level=1, craved_need=2)
+    check("N1: last craved pair dropped", r == [], f"got {[g[0] for g in r]}")
+    # N2: surplus (4, need 2 -> 2 survive) -> kept.
+    r = ranked_merge_groups(eye_board(4), craved_item="eyemonster",
+                            craved_level=1, craved_need=2)
+    check("N2: surplus craved merge kept", len(r) == 1
+          and r[0][0] == "eyemonster_lvl1")
+    # N3: need 1, pair of 2 -> dropped (0 < 1 survive).
+    r = ranked_merge_groups(eye_board(2), craved_item="eyemonster",
+                            craved_level=1, craved_need=1)
+    check("N3: need-1 pair dropped", r == [])
+    # N4: level unknown (bubble-only) -> old behavior, kept.
+    r = ranked_merge_groups(eye_board(2), craved_item="eyemonster",
+                            craved_level=None, craved_need=2)
+    check("N4: unknown level keeps merge", len(r) == 1)
+    # N5: need unknown -> kept.
+    r = ranked_merge_groups(eye_board(2), craved_item="eyemonster",
+                            craved_level=1, craved_need=None)
+    check("N5: unknown need keeps merge", len(r) == 1)
+    # N6: higher level than craved -> kept (not the craved id).
+    r = ranked_merge_groups(eye_board(0, 2), craved_item="eyemonster",
+                            craved_level=1, craved_need=2)
+    check("N6: lvl2 pair kept for lvl1 craving", len(r) == 1
+          and r[0][0] == "eyemonster_lvl2")
+    # N7: precursor merge (eyeinajar -> lvl1) still builds the craving.
+    b = board([(0, 0, "eyeinajar", 0.9), (0, 1, "eyeinajar", 0.9)])
+    r = ranked_merge_groups(b, craved_item="eyemonster",
+                            craved_level=1, craved_need=2)
+    check("N7: precursor merge kept", len(r) == 1
+          and r[0][0] == "eyeinajar")
+
+    # _validate rejections (same logic on a proposed pair).
+    mv = Move(kind="merge", cell_a=(0, 0), cell_b=(0, 1))
+    reason = LLMPlanner._validate(
+        eye_board(2), mv, mana=1.0, max_level=set(),
+        craved_item="eyemonster", craved_level=1, craving_need=2)
+    check("N8: _validate rejects last-pair merge",
+          reason == "merge_craving_material:eyemonster_lvl1", f"got {reason!r}")
+    reason = LLMPlanner._validate(
+        eye_board(4), mv, mana=1.0, max_level=set(),
+        craved_item="eyemonster", craved_level=1, craving_need=2)
+    check("N9: _validate allows surplus merge", reason is None,
+          f"got {reason!r}")
+    reason = LLMPlanner._validate(
+        eye_board(2), mv, mana=1.0, max_level=set(),
+        craved_item="eyemonster", craved_level=None, craving_need=2)
+    check("N10: _validate allows on unknown level", reason is None,
+          f"got {reason!r}")
+
+
 def main() -> int:
     part_a()
     part_b()
@@ -1039,6 +1106,7 @@ def main() -> int:
     part_k()
     part_l()
     part_m()
+    part_n()
     print(f"\n{len(PASS)}/{len(PASS) + len(FAIL)} checks passed")
     return 0 if not FAIL else 1
 

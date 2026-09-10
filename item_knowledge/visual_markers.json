@@ -241,5 +241,81 @@
     "merge_edges": [],
     "source": "popup",
     "updated": "2026-09-02T19:43:12.005868"
+  },
+  "zombie_lvl3": {
+    "description": "Merge to summon a higher lvl Zombie.",
+    "merge_edges": [
+      "zombie -> zombie"
+    ],
+    "source": "popup",
+    "updated": "2026-09-03T19:24:13.984492"
+  },
+  "icerunes_lvl1": {
+    "description": "Merge to create a bigger pile or feed to the Devourer.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-09-04T04:39:28.274018"
+  },
+  "poisonrunes_lvl1": {
+    "description": "Merge to create a bigger pile or feed to the Devourer.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-09-04T04:40:44.039469"
+  },
+  "zombie_lvl4": {
+    "description": "Merge to summon a higher lvl Zombie.",
+    "merge_edges": [
+      "zombie -> zombie"
+    ],
+    "source": "popup",
+    "updated": "2026-09-05T02:25:28.811109"
+  },
+  "bloodrune_lvl2": {
+    "description": "Merge to create a bigger pile or feed to the Devourer.",
+    "merge_edges": [
+      "bloodrune -> bigger pile"
+    ],
+    "source": "popup",
+    "updated": "2026-09-05T19:07:16.130203"
+  },
+  "supplycupboard_lvl1": {
+    "description": "Tap to spawn components. Merge to level up.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-09-06T00:49:54.455577"
+  },
+  "eyeball": {
+    "description": "Merge to summon a Eye in a Jar.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-09-06T01:36:42.292903"
+  },
+  "cauldron": {
+    "description": "Tap to spawn potions.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-09-06T02:14:22.177043"
+  },
+  "eyeinajar": {
+    "description": "Merge to summon a Eye Monster.",
+    "merge_edges": [],
+    "source": "popup",
+    "updated": "2026-09-06T03:09:07.502106"
+  },
+  "zombie_lvl5": {
+    "description": "Merge to summon a higher lvl Zombie.",
+    "merge_edges": [
+      "zombie -> zombie"
+    ],
+    "source": "popup",
+    "updated": "2026-09-06T03:51:31.661591"
+  },
+  "eyemonster_lvl3": {
+    "description": "Merge to summon a higher lvl Eye Monster.",
+    "merge_edges": [
+      "eyemonster -> eye monster"
+    ],
+    "source": "popup",
+    "updated": "2026-09-07T17:57:11.618756"
   }
 }

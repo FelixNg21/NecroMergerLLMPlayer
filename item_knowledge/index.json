@@ -1,248 +1,134 @@
 {
-  "bone": {
+  "skeleton_lvl4": {
     "sections": [
-      "item_stats",
-      "visual_markers",
-      "merge_chain"
+      "item_stats"
     ],
-    "last_seen": "2026-08-31T13:22:26.334591"
+    "last_seen": "2026-09-05T01:26:55.546935"
   },
-  "ribcage": {
+  "icerunes_lvl1": {
     "sections": [
-      "item_stats",
       "visual_markers",
-      "merge_chain"
+      "item_stats"
     ],
-    "last_seen": "2026-08-31T13:22:26.334601"
+    "last_seen": "2026-09-04T04:39:28.275069"
   },
-  "icebox_unopened": {
+  "poisonrunes_lvl1": {
     "sections": [
       "visual_markers",
+      "item_stats"
+    ],
+    "last_seen": "2026-09-04T04:40:44.042126"
+  },
+  "fridge_lvl1": {
+    "sections": [
       "spawn_rates"
     ],
-    "last_seen": "2026-08-31T13:22:26.334677"
+    "last_seen": "2026-09-04T05:00:00.000000"
   },
-  "icerune_lvl3": {
+  "fridge_lvl2": {
     "sections": [
-      "item_stats",
-      "visual_markers",
-      "merge_chain"
+      "spawn_rates"
     ],
-    "last_seen": "2026-08-31T13:22:26.334685"
+    "last_seen": "2026-09-04T05:00:00.000000"
   },
-  "icerune_lvl1": {
+  "fridge_lvl3": {
     "sections": [
-      "merge_chain",
-      "item_stats",
-      "visual_markers"
+      "spawn_rates"
     ],
-    "last_seen": "2026-08-31T15:16:17.109972"
+    "last_seen": "2026-09-04T05:00:00.000000"
   },
-  "icerune_lvl2": {
+  "fridge_lvl4": {
     "sections": [
-      "merge_chain",
-      "item_stats",
-      "visual_markers"
+      "spawn_rates"
     ],
-    "last_seen": "2026-08-31T13:22:26.334807"
+    "last_seen": "2026-09-04T05:00:00.000000"
   },
-  "poisonrune_lvl1": {
+  "fridge_lvl5": {
     "sections": [
-      "item_stats",
-      "visual_markers",
-      "merge_chain"
+      "spawn_rates"
     ],
-    "last_seen": "2026-08-31T13:22:26.334815"
-  },
-  "coins_lvl1": {
-    "sections": [
-      "item_stats",
-      "visual_markers"
-    ],
-    "last_seen": "2026-08-31T13:22:26.334832"
+    "last_seen": "2026-09-04T05:00:00.000000"
   },
   "valuablechest": {
     "sections": [
-      "visual_markers"
-    ],
-    "last_seen": "2026-08-31T13:22:26.334837"
-  },
-  "coins_lvl2": {
-    "sections": [
-      "item_stats",
-      "visual_markers"
-    ],
-    "last_seen": "2026-08-31T13:22:26.334843"
-  },
-  "poisonrune_lvl2": {
-    "sections": [
-      "item_stats",
-      "visual_markers",
-      "merge_chain"
-    ],
-    "last_seen": "2026-08-31T13:22:26.334849"
-  },
-  "poisonrune_lvl3": {
-    "sections": [
-      "item_stats",
-      "visual_markers",
-      "merge_chain"
-    ],
-    "last_seen": "2026-08-31T13:22:26.334854"
-  },
-  "grave_lvl1": {
-    "sections": [
-      "spawn_rates",
-      "visual_markers"
-    ],
-    "last_seen": "2026-08-31T15:35:18.757380"
-  },
-  "manapotion_lvl3": {
-    "sections": [
-      "item_stats",
-      "visual_markers"
-    ],
-    "last_seen": "2026-08-31T13:22:26.334997"
-  },
-  "coins_lvl3": {
-    "sections": [
-      "item_stats",
-      "visual_markers"
-    ],
-    "last_seen": "2026-08-31T13:22:26.335003"
-  },
-  "manapotion_lvl1": {
-    "sections": [
-      "visual_markers"
-    ],
-    "last_seen": "2026-08-31T13:22:26.335008"
-  },
-  "manapot_lvl3": {
-    "sections": [
-      "item_stats",
-      "visual_markers"
-    ],
-    "last_seen": "2026-08-31T13:22:26.335014"
-  },
-  "necromancer": {
-    "sections": [
-      "item_stats",
-      "visual_markers"
-    ],
-    "last_seen": "2026-08-31T13:22:26.335020"
-  },
-  "icerunes": {
-    "sections": [
-      "item_stats",
-      "visual_markers"
-    ],
-    "last_seen": "2026-08-31T13:22:26.335029"
-  },
-  "manapool_lvl1": {
-    "sections": [
-      "visual_markers"
-    ],
-    "last_seen": "2026-08-31T13:22:26.335033"
-  },
-  "rottenflesh": {
-    "sections": [
-      "item_stats",
-      "visual_markers"
-    ],
-    "last_seen": "2026-08-31T13:22:26.335043"
-  },
-  "grave_lvl3": {
-    "sections": [
-      "visual_markers",
       "spawn_rates"
     ],
-    "last_seen": "2026-08-31T15:35:18.760361"
-  },
-  "severedhand": {
-    "sections": [
-      "item_stats",
-      "visual_markers"
-    ],
-    "last_seen": "2026-08-31T13:22:26.335053"
-  },
-  "skeleton": {
-    "sections": [
-      "merge_chain"
-    ],
-    "last_seen": "2026-09-02T15:30:29.058572"
-  },
-  "grave_lvl3lvl3 ": {
-    "sections": [
-      "spawn_rates"
-    ],
-    "last_seen": "2026-08-31T15:29:54.417454"
-  },
-  "grave_lvl1lvl1 ": {
-    "sections": [
-      "spawn_rates"
-    ],
-    "last_seen": "2026-08-31T15:29:54.413990"
-  },
-  "grave_lvl2": {
-    "sections": [
-      "spawn_rates"
-    ],
-    "last_seen": "2026-08-31T15:30:09.114884"
+    "last_seen": "2026-09-04T05:00:00.000000"
   },
   "skeleton_lvl6": {
     "sections": [
       "item_stats"
     ],
-    "last_seen": "2026-08-31T19:54:37.376181"
+    "last_seen": "2026-09-05T13:39:33.792862"
   },
-  "zombie_lvl1": {
+  "ribcage": {
+    "sections": [
+      "item_stats"
+    ],
+    "last_seen": "2026-09-05T19:23:07.928010"
+  },
+  "necromancer": {
+    "sections": [
+      "item_stats"
+    ],
+    "last_seen": "2026-09-05T23:13:05.185938"
+  },
+  "eyeball": {
     "sections": [
       "visual_markers",
       "item_stats"
     ],
-    "last_seen": "2026-08-31T20:08:10.413730"
+    "last_seen": "2026-09-07T17:14:03.310871"
   },
-  "skeleton_lvl4": {
+  "cauldron": {
+    "sections": [
+      "visual_markers"
+    ],
+    "last_seen": "2026-09-06T02:14:22.179474"
+  },
+  "eyeinajar": {
+    "sections": [
+      "visual_markers",
+      "item_stats"
+    ],
+    "last_seen": "2026-09-06T03:09:07.710119"
+  },
+  "coins_lvl2": {
     "sections": [
       "item_stats"
     ],
-    "last_seen": "2026-09-01T11:06:48.377975"
+    "last_seen": "2026-09-07T18:39:44.872730"
+  },
+  "zombie_lvl5": {
+    "sections": [
+      "visual_markers",
+      "item_stats"
+    ],
+    "last_seen": "2026-09-06T03:51:31.669202"
+  },
+  "eyemonster_lvl1": {
+    "sections": [
+      "item_stats"
+    ],
+    "last_seen": "2026-09-07T17:14:10.818190"
+  },
+  "eyemonster_lvl3": {
+    "sections": [
+      "visual_markers",
+      "item_stats"
+    ],
+    "last_seen": "2026-09-07T17:57:11.622498"
   },
   "skeleton_lvl3": {
     "sections": [
       "item_stats"
     ],
-    "last_seen": "2026-09-02T19:39:02.730133"
+    "last_seen": "2026-09-07T18:31:51.685516"
   },
-  "zombie": {
-    "sections": [
-      "merge_chain"
-    ],
-    "last_seen": "2026-09-02T15:30:29.059565"
-  },
-  "skeleton_lvl2": {
+  "bone": {
     "sections": [
       "item_stats"
     ],
-    "last_seen": "2026-09-02T17:12:01.049870"
-  },
-  "lockedchest": {
-    "sections": [
-      "visual_markers"
-    ],
-    "last_seen": "2026-09-02T18:33:36.792617"
-  },
-  "peasant": {
-    "sections": [
-      "item_stats"
-    ],
-    "last_seen": "2026-09-02T19:23:03.294065"
-  },
-  "gems_lvl1": {
-    "sections": [
-      "visual_markers",
-      "item_stats"
-    ],
-    "last_seen": "2026-09-02T19:43:12.009291"
+    "last_seen": "2026-09-07T18:32:18.028479"
   }
 }

@@ -99,10 +99,10 @@ Feeding a Rib Cage does not summon a Skeleton; it only grants +2 Feed.
 
 ## Learning Aug 23, 2026 22:29 (step 12)
 
-status: candidate
+status: committed
 type: pattern
 confidence: 0.70
-confirmed: 1
+confirmed: 2
 negative: 0
 outcome_log: []
 
@@ -110,10 +110,10 @@ Feeding a Bone grants +1 Feed.
 
 ## Learning Aug 23, 2026 23:03 (step 10)
 
-status: candidate
+status: committed
 type: pattern
 confidence: 0.70
-confirmed: 0
+confirmed: 2
 negative: 0
 outcome_log: []
 
@@ -140,28 +140,6 @@ negative: 1
 outcome_log: []
 
 Feeding a Skeleton_lvl1 grants +10 Feed.
-
-## Learning Aug 23, 2026 23:03 (step 10)
-
-status: candidate
-type: pattern
-confidence: 0.70
-confirmed: 0
-negative: 0
-outcome_log: []
-
-Feeding a Skeleton does not summon a new entity; it only increases Feed value.
-
-## Learning Aug 23, 2026 23:03 (step 10)
-
-status: candidate
-type: pattern
-confidence: 0.70
-confirmed: 0
-negative: 0
-outcome_log: []
-
-Multiple Skeletons can be merged in sequence to produce higher-level Skeletons.
 
 ## Learning Aug 23, 2026 23:10 (step 10)
 
@@ -229,60 +207,16 @@ outcome_log: []
 
 Rib Cages can be merged to summon Skeletons with +2 Feed.
 
-## Learning Aug 24, 2026 12:27 (step 40)
+## Learning Aug 24, 2026 17:16 (step 45)
 
 status: committed
 type: pattern
 confidence: 0.70
 confirmed: 2
-negative: 0
-outcome_log: []
-
-Skeleton_lvl5 is not directly summonable; it must be merged from two Skeleton_lvl4 items.
-
-## Learning Aug 24, 2026 17:16 (step 45)
-
-status: candidate
-type: pattern
-confidence: 0.70
-confirmed: 1
 negative: 0
 outcome_log: []
 
 Skeleton_lvl1 can be summoned by merging two Skeleton_lvl0 items (though not visible in this window).
-
-## Learning Aug 24, 2026 20:03 (step 20)
-
-status: committed
-type: pattern
-confidence: 0.70
-confirmed: 2
-negative: 0
-outcome_log: []
-
-Skeleton_lvl5 is the highest level visible in this window and can be merged to produce a higher level.
-
-## Learning Aug 24, 2026 20:03 (step 20)
-
-status: committed
-type: pattern
-confidence: 0.70
-confirmed: 2
-negative: 1
-outcome_log: []
-
-Feeding a Skeleton_lvl6 grants +700 Feed, confirmed by UI value.
-
-## Learning Aug 25, 2026 13:19 (step 5)
-
-status: committed
-type: pattern
-confidence: 0.70
-confirmed: 2
-negative: 0
-outcome_log: []
-
-A Skeleton_lvl5 grants +700 Feed when fed.
 
 ## Learning Aug 26, 2026 06:55 (step 265)
 
@@ -306,39 +240,6 @@ outcome_log: []
 
 A Skeleton_lvl7 spawns from merging two Skeleton_lvl6 items.
 
-## Learning Aug 29, 2026 12:15 (step 5)
-
-status: committed
-type: pattern
-confidence: 0.70
-confirmed: 2
-negative: 1
-outcome_log: []
-
-Skeleton_lvl7 is the highest level visible and grants +1500 Feed when fed.
-
-## Learning Aug 30, 2026 00:56 (step 5)
-
-status: committed
-type: pattern
-confidence: 0.70
-confirmed: 2
-negative: 0
-outcome_log: []
-
-Feeding a Skeleton_lvl5 grants +700 Feed.
-
-## Learning Aug 30, 2026 01:34 (step 5)
-
-status: committed
-type: pattern
-confidence: 0.70
-confirmed: 2
-negative: 0
-outcome_log: []
-
-Feeding a Skeleton_lvl7 grants +1500 Feed.
-
 ## Learning Aug 30, 2026 03:04 (step 2)
 
 status: committed
@@ -349,39 +250,6 @@ negative: 0
 outcome_log: []
 
 Grave_lvl2 is the highest level visible and can spawn bone or ribcage.
-
-## Learning Aug 30, 2026 14:43 (step 8)
-
-status: committed
-type: pattern
-confidence: 0.70
-confirmed: 2
-negative: 0
-outcome_log: []
-
-Feeding the Devourer with a Skeleton_lvl6 will level it up but waste 682 Food (any excess Food is wasted after levelling up).
-
-## Learning Aug 31, 2026 12:58 (step 10)
-
-status: committed
-type: pattern
-confidence: 0.70
-confirmed: 2
-negative: 0
-outcome_log: []
-
-Feeding a Rib Cage grants +2 Feed when merged.
-
-## Learning Aug 31, 2026 12:58 (step 10)
-
-status: committed
-type: pattern
-confidence: 0.70
-confirmed: 2
-negative: 0
-outcome_log: []
-
-Feeding a Skeleton_lvl4 is not required before merging to summon a higher level; the merge action itself triggers the summon.
 
 ## Learning Aug 31, 2026 18:29 (step 10)
 
@@ -394,18 +262,18 @@ outcome_log: []
 
 Grave_lvl3 spawns bone, ribcage, or zombie with 100% probability when tapped.
 
-## Learning Aug 31, 2026 19:32 (step 10)
+## Learning Sep 02, 2026 23:59 (step 5)
 
 status: committed
-type: fact
-confidence: 0.98
+type: pattern
+confidence: 0.70
 confirmed: 2
-negative: 0
+negative: 1
 outcome_log: []
 
-A Skeleton_lvl6 can be fed to grant +700 Feed.
+Merging two Skeleton_lvl3 items summons a Skeleton_lvl4.
 
-## Learning Aug 31, 2026 20:01 (step 30)
+## Learning Sep 05, 2026 19:06 (step 5)
 
 status: committed
 type: pattern
@@ -414,9 +282,9 @@ confirmed: 2
 negative: 0
 outcome_log: []
 
-A Skeleton_lvl5 can be summoned by merging two Skeleton_lvl4 items.
+A Skeleton_lvl5 is the highest level visible in this window and can be merged to produce a higher level.
 
-## Learning Aug 31, 2026 20:06 (step 35)
+## Learning Sep 05, 2026 19:39 (step 15)
 
 status: committed
 type: fact
@@ -425,60 +293,60 @@ confirmed: 2
 negative: 0
 outcome_log: []
 
-[fact] Skeleton_lvl1 can be fed to grant +10 Feed.
+Grave_lvl1 spawns bone when tapped.
 
-## Learning Sep 01, 2026 11:55 (step 175)
+## Learning Sep 05, 2026 19:54 (step 20)
 
-status: candidate
-type: visual
-confidence: 0.80
-confirmed: 0
+status: committed
+type: pattern
+confidence: 0.70
+confirmed: 2
 negative: 0
 outcome_log: []
 
-[visual] A Rib Cage is a green, bone-like item with a 'Merge to summon a Skeleton' description.
+A Skeleton_lvl3 can be summoned by merging two Skeleton_lvl2 items.
 
-## Learning Sep 02, 2026 23:59 (step 5)
+## Learning Sep 06, 2026 03:16 (step 10)
+
+status: committed
+type: anti-pattern
+confidence: 0.80
+confirmed: 2
+negative: 0
+outcome_log: []
+
+Never feed a Station to the Devourer — stations are board fixtures, not food.
+
+## Learning Sep 06, 2026 07:46 (step 100)
+
+status: candidate
+type: anti-pattern
+confidence: 0.80
+confirmed: 1
+negative: 0
+outcome_log: []
+
+Never feed a Champion to the Devourer. A Champion is defeated by dragging a creature onto it, not by feeding.
+
+## Learning Sep 06, 2026 07:46 (step 100)
+
+status: committed
+type: anti-pattern
+confidence: 0.70
+confirmed: 2
+negative: 0
+outcome_log: []
+
+Don't feed a mid-chain merge component (bone, ribcage, or an item that can still merge up) while a non-mergeable feedable exists — merge-material exists to build merges, feeding it destroys pairs.
+
+## Learning Sep 06, 2026 07:48 (step 100)
 
 status: candidate
 type: pattern
 confidence: 0.70
-confirmed: 0
-negative: 1
+confirmed: 1
+negative: 0
 outcome_log: []
 
-Merging two Skeleton_lvl3 items summons a Skeleton_lvl4.
-
-## Learning Sep 02, 2026 23:59 (step 5)
-
-status: candidate
-type: pattern
-confidence: 0.70
-confirmed: 0
-negative: 1
-outcome_log: []
-
-Feeding a Skeleton_lvl6 grants +300 Feed.
-
-## Learning Sep 02, 2026 23:59 (step 5)
-
-status: candidate
-type: pattern
-confidence: 0.70
-confirmed: 0
-negative: 1
-outcome_log: []
-
-The Devourer has no current feed value shown, indicating it is not yet fed.
-
-## Learning Sep 02, 2026 23:59 (step 5)
-
-status: candidate
-type: pattern
-confidence: 0.70
-confirmed: 0
-negative: 1
-outcome_log: []
-
-Grave_lvl1 spawns bone/ribcage when tapped.
+Supply Cupboard_Lvl1 spawns components and can be merged to level up.
 

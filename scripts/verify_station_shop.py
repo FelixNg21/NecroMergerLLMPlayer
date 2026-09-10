@@ -72,6 +72,7 @@ class FakeDevice:
         self.frames = list(frames)      # indexed with a clamping cursor
         self._i = 0
         self.taps = []
+        self.swipes = []                # card-row scroll gestures
         self.backs = 0
         self.bottombar = FakeBottomBar()
         self.screencap_path = Path(tempfile.mkdtemp()) / "cap.png"
@@ -88,6 +89,11 @@ class FakeDevice:
         self.taps.append((int(x), int(y)))
         if y > 2600:            # a dock-band tap opens the panel
             self.bottombar.panel_open = True
+
+    def swipe(self, x1, y1, x2, y2, duration_ms=300):
+        self.swipes.append((int(x1), int(y1), int(x2), int(y2)))
+        # sheet position is frame-driven in tests (frames list); swipes
+        # only record the gesture.
 
     def back(self):
         self.backs += 1

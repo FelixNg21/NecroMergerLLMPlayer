@@ -96,6 +96,79 @@ def has_reward(frame) -> bool:
     return gray >= REWARD_TEX_MIN
 
 
+# Chest families recognizable in the dock icon (must match template-bank
+# ids — no invented ids). The dock icon is small (~62x51) vs board sprites
+# (~150px+), so matching is multi-scale downward.
+REWARD_ID_TEMPLATES = {
+    "icebox_unopened": "icebox_unopened",
+    "lockedchest": "lockedchest",
+    "valuablechest": "valuablechest",
+}
+REWARD_ID_SCALES = (0.25, 0.3, 0.35, 0.4, 0.5)
+REWARD_ID_MIN = 0.55
+# Short display names for the Bottom bar line.
+REWARD_DISPLAY = {
+    "icebox_unopened": "ice chest",
+    "lockedchest": "locked chest",
+    "valuablechest": "valuable chest",
+}
+
+
+def _reward_templates() -> dict[str, list]:
+    """{chest id: [grayscale sprite]} from the template bank (cached)."""
+    if not hasattr(_reward_templates, "_cache"):
+        base = Path(__file__).resolve().parent.parent / "assets" / "templates"
+        out: dict[str, list] = {}
+        for item_id, prefix in REWARD_ID_TEMPLATES.items():
+            imgs = []
+            for p in sorted(base.glob(f"{prefix}__*.png")):
+                img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+                if img is not None:
+                    imgs.append(img)
+            # also accept un-suffixed files (e.g. manapot_lvl1.png style)
+            for p in sorted(base.glob(f"{prefix}.png")):
+                img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+                if img is not None:
+                    imgs.append(img)
+            out[item_id] = imgs
+        _reward_templates._cache = out
+    return _reward_templates._cache
+
+
+def queued_reward_id(frame) -> str | None:
+    """Template-only identity of the queued dock reward (no LLM — safe to
+    call every step). Returns the chest id (e.g. 'icebox_unopened') or None
+    when the queue is empty or the icon isn't a recognized chest (rune
+    piles, gems, and future reward types have no dock templates yet).
+
+    Cheap: only runs when has_reward is already true; a few small
+    matchTemplate calls on a 62x51 crop.
+    """
+    if frame is None or not has_reward(frame):
+        return None
+    try:
+        cx, cy, w, h = QUEUE_ICON
+        crop = frame[cy - h // 2: cy - h // 2 + h, cx - w // 2: cx - w // 2 + w]
+        if crop is None or crop.size == 0:
+            return None
+        g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        best_id, best_score = None, REWARD_ID_MIN
+        for item_id, tpls in _reward_templates().items():
+            for tpl in tpls:
+                th, tw = tpl.shape[:2]
+                for s in REWARD_ID_SCALES:
+                    nw, nh = max(1, int(tw * s)), max(1, int(th * s))
+                    if nh > g.shape[0] or nw > g.shape[1]:
+                        continue
+                    small = cv2.resize(tpl, (nw, nh), interpolation=cv2.INTER_AREA)
+                    score = float(cv2.matchTemplate(g, small, cv2.TM_CCOEFF_NORMED).max())
+                    if score > best_score:
+                        best_score, best_id = score, item_id
+        return best_id
+    except Exception:
+        return None
+
+
 class QueueBox:
     """Place the queued reward. Chests on the board are now spawn stations
     (use a normal `spawn` move, one tap per use — see planner/agent.py)."""

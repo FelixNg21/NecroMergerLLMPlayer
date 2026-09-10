@@ -9,7 +9,7 @@ recognizes items across sessions.
 New format (item_knowledge/):
 - merge_chains.json: {family: {chain: [...], source: "popup|wiki", updated: iso}}
 - spawn_rates.json: {station_id: {targets: [...], uses: int|null, source, updated}}
-- item_stats.json: {template_id: {feed: int|null, damage: int|null, max_level: bool, source, updated}}
+- item_stats.json: {template_id: {feed: int|null, damage: int|null, max_level: bool, makes: {resource: rate}|absent (wiki generation data, preserved across popup writes), source, updated}}
 - visual_markers.json: {template_id: {description: str|null, merge_edges: [...], source, updated}}
 - index.json: master index {template_id: {sections: [...], last_seen: iso}}
 
@@ -17,6 +17,7 @@ Old format (item_glossary.md): markdown blocks (DEPRECATED, kept for backward co
 """
 
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -63,8 +64,16 @@ def _load_json(path: Path, default=None):
 
 
 def _save_json(path: Path, data: dict) -> None:
+    if not isinstance(data, dict):
+        raise ValueError(f"Data to save must be a dict, got {type(data)}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2))
+    json_dump = json.dumps(data, indent=2)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8" ) as f:
+        f.write(json_dump)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def _get_knowledge_dir(path: Path) -> Path:
@@ -366,8 +375,12 @@ def write_spawn_rate(station_id: str, targets: list[str], uses: int | None,
 
 def write_item_stat(template_id: str, feed: int | None = None,
                     damage: int | None = None, max_level: bool = False,
+                    makes: dict | None = None,
                     source: str = "popup", knowledge_dir: Path | None = None) -> None:
-    """Write/update item stats (feed, damage, max_level)."""
+    """Write/update item stats (feed, damage, max_level, makes).
+
+    `makes` (e.g. {"mana": 2}) is wiki-grounded generation data — popup
+    writes never provide it, so an existing value is always preserved."""
     paths = _get_paths(knowledge_dir)
     data = _load_json(paths["item_stats"])
     existing = data.get(template_id, {})
@@ -375,9 +388,14 @@ def write_item_stat(template_id: str, feed: int | None = None,
         "feed": feed if feed is not None else existing.get("feed"),
         "damage": damage if damage is not None else existing.get("damage"),
         "max_level": max_level or existing.get("max_level", False),
+        "makes": makes if makes is not None else existing.get("makes"),
         "source": source if feed is not None or damage is not None else existing.get("source", source),
         "updated": _now(),
     }
+    # Drop the makes key when neither old nor new has one (keeps popup-only
+    # entries in the old shape so stats diffs stay readable).
+    if data[template_id]["makes"] is None:
+        del data[template_id]["makes"]
     _save_json(paths["item_stats"], data)
     _update_index(template_id, "item_stats", knowledge_dir)
 
@@ -471,20 +489,49 @@ def wiki_cross_check_spawn_rates(wiki_spawns: dict[str, dict],
 # EXPIRATION / PRUNING
 # =====================================================================
 
-def prune_inferred_entries(max_age_sessions: int = 10,
+def prune_inferred_entries(max_age_days: int = 14,
                             knowledge_dir: Path | None = None) -> int:
-    """Remove inferred entries not re-confirmed in N sessions.
-    Returns number of entries pruned."""
+    """Remove inferred entries not re-confirmed within max_age_days.
+
+    Inferred entries (migration guesses, unconfirmed reads) carry
+    source="inferred"; a later grounded re-read upgrades the source to
+    popup/wiki via the write_* calls, which exempts the entry. Stale
+    inferred entries are the weakest knowledge in the store — drop them
+    rather than letting the model plan on guesses. Returns entries pruned.
+    """
+    from datetime import datetime, timedelta
     paths = _get_paths(knowledge_dir)
-    stats = _load_json(paths["item_stats"])
-    markers = _load_json(paths["visual_markers"])
-    index = _load_json(paths["index"])
+    cutoff = datetime.now() - timedelta(days=max_age_days)
     pruned = 0
-    
-    for template_id, entry in list(stats.items()):
-        if entry.get("source") == "inferred":
-            pass
-    
+
+    def _stale(entry: dict) -> bool:
+        if entry.get("source") != "inferred":
+            return False
+        try:
+            return datetime.fromisoformat(entry.get("updated", "")) < cutoff
+        except (ValueError, TypeError):
+            return True  # no timestamp -> treat as stale
+
+    stats = _load_json(paths["item_stats"])
+    for tid in [t for t, e in stats.items() if _stale(e)]:
+        del stats[tid]
+        pruned += 1
+    _save_json(paths["item_stats"], stats)
+    markers = _load_json(paths["visual_markers"])
+    for tid in [t for t, e in markers.items() if _stale(e)]:
+        del markers[tid]
+        pruned += 1
+    _save_json(paths["visual_markers"], markers)
+    # Drop index rows left pointing at nothing prunable (chains/spawns
+    # have their own lifecycle and are never touched here).
+    index = _load_json(paths["index"])
+    for tid in [t for t in index
+                if t not in stats and t not in markers
+                and set(index[t].get("sections", [])) <= {"item_stats", "visual_markers"}]:
+        del index[tid]
+        pruned += 1
+    _save_json(paths["index"], index)
+
     return pruned
 
 

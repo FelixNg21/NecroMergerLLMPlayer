@@ -29,6 +29,7 @@ from planner.agent import (
     SPAWN_TAPS,
     SPAWN_PREFIXES,
     STATION_PREFIXES,
+    best_attack_pair,
     best_feed_cell,
     necromerger_cell,
     _should_feed,
@@ -41,7 +42,6 @@ from planner.glossary import (
     prune_glossary_by_ids,
     _get_knowledge_dir,
 )
-from planner.strategy_planner import StrategyPlanner, create_strategy_planner
 from planner.learnings import DEFAULT_PATH as LEARNINGS_DEFAULT
 from planner.learnings import (
     append_learning,
@@ -56,12 +56,16 @@ from planner.learnings import (
 from planner.llm import LLMPlanner, _extract_json
 from planner.llm_client import LLMClient, LLMError
 from planner.llm_vision import _encode_frame
-from planner.merge import merge_result_id, ranked_merge_groups
+from planner.merge import is_merge_material, merge_result_id, ranked_merge_groups
 from planner.constants import (
     CHEST_PREFIXES,
     CHEST_SPAWN_PREFIXES,
     GRAVE_SPAWN_PREFIXES,
+    SATIETY_TOL_FRACTION,
+    SLIME_SPAWN_PREFIXES,
+    canonical_family,
     craved_matches,
+    display_family,
     item_name_matches,
     normalize_item_name,
 )
@@ -84,9 +88,13 @@ MAX_CRAVINGS = 1           # get_cravings menu cycles allowed per step (intrusiv
 MAX_PANELS = 1             # tap_button open/read/close cycles allowed per step (intrusive)
 MAX_CHAMPIONS = 1          # get_champions menu cycles allowed per step (intrusive)
 MAX_POPUP_READS = 1        # auto popup-body reads of known-but-unbanked items per step
+LABEL_MEMORY_TTL = 10      # popup-label persistence lifetime (steps) — safety valve on stale reads
+LABEL_MEMORY_PAIR = frozenset({"eyeball", "eyemonster_lvl1"})  # template-indistinguishable pair (cross-bank ~1.0)
 CRAVINGS_REFRESH_STEPS = 10  # cache a full menu read for this many steps before re-reading
 CHAMPIONS_REFRESH_STEPS = 10  # cache the champion-screen read for this many steps before re-reading
 FEATS_REFRESH_STEPS = 15     # cache a feats-panel read for this many steps before re-reading
+FEAT_COLLECT_STEPS = 5       # opportunistic feat-collect retry when a done feat sits uncollected
+MAX_FEAT_COLLECT = 1         # collect_feat_rewards tool calls per step
 # cross-step rejection TTL. A previous step's rejected action stays
 # pre-blocked for up to this many steps before the TTL filter expires it
 # (the board may have shifted past the rejection's premise by then — a
@@ -120,7 +128,146 @@ STATION_FAMILIES = frozenset({
     "telepad", "soulgrinder", "prism", "meteor", "throne", "unexpectedparcel",
 })
 
-# alias table for ALL station names from the wiki. `normalize_station_name`
+# Meta-goal definitions (moved from the retired StrategyPlanner): threshold
+# checks over cached state plus the family to build toward. Evaluated
+# code-side into a one-line "Suggested direction" — no LLM call. Every
+# check MUST be None-safe (missing data means "unknown", never a goal):
+# the old evaluator's darkness check defaulted a missing key to 0 and
+# fired unconditionally.
+META_GOALS = {
+    "champion_combat": {
+        "target_family": None,
+        "threshold_check": lambda state: state.get("champion") is not None,
+        "description": "champion present → prioritize high-damage minions, attack",
+    },
+    "feeding_optimization": {
+        "target_family": None,
+        "threshold_check": lambda state: (
+            state.get("satiety_remaining") is not None
+            and state.get("satiety_capacity") is not None
+            and state.get("satiety_capacity") > 0
+            and state.get("satiety_remaining") < 20),
+        "description": "satiety near cap → feed efficiently, avoid overflow",
+    },
+    "board_management": {
+        "target_family": None,
+        "threshold_check": lambda state: (state.get("board_congestion") or 0) > 0.8,
+        "description": "board congested → merge aggressively, feed non-critical",
+    },
+    "slime_generation": {
+        "target_family": "slimevat",
+        "threshold_check": lambda state: (
+            state.get("slime_count") is not None
+            and state.get("slime_count") < 20),
+        "description": "slime is low → prioritize slimevat builds, slime-producing minions",
+    },
+    "mana_generation": {
+        "target_family": "manapool",
+        "threshold_check": lambda state: (
+            state.get("mana_pct") is not None and state.get("mana_pct") < 30),
+        "description": "mana is low → prioritize manapool builds, mana-producing minions",
+    },
+    "rune_economy": {
+        "target_family": "grave",
+        "threshold_check": lambda state: (
+            sum((state.get("runes") or {}).values()) < 50),
+        "description": "rune balances low → prioritize chest spawns, rune merges, rune feeds",
+    },
+}
+META_GOAL_PRIORITY = (
+    "champion_combat",
+    "feeding_optimization",
+    "board_management",
+    "slime_generation",
+    "mana_generation",
+    "rune_economy",
+)
+
+# Craving item family -> (producer station family, feedable/board component ids).
+# Closes the "craving for something the board cannot produce" gap: the craving
+# objective only boosts FEEDING the item when present, and no strategy, hint,
+# or spawn line otherwise connects a craving to its source station (observed:
+# eyemonster craving with no Supply Cupboard/Fridge on the board — the bot
+# worked feats while the craving sat). Families with unknown producers are
+# omitted (mapping returns None -> no line, no behavior change). Component
+# ids use the normalize_item_name convention ('Eye in a Jar' -> 'eyeinjar').
+CRAVING_PRODUCERS = {
+    "eyemonster": ("supplycupboard", ("eyeball", "eyeinjar")),
+    "eyeball": ("supplycupboard", ("eyeball",)),
+    "eyeinjar": ("supplycupboard", ("eyeball", "eyeinjar")),
+    "skeleton": ("grave", ("bone", "ribcage")),
+    "zombie": ("grave", ("bone", "ribcage", "rottenflesh", "severedhand")),
+    "bone": ("grave", ("bone",)),
+    "ribcage": ("grave", ("bone", "ribcage")),
+    "rottenflesh": ("grave", ("rottenflesh",)),
+    "severedhand": ("grave", ("rottenflesh", "severedhand")),
+}
+
+# Resource economy (wiki-grounded: Mana, Slime, Grave, Supply_Cupboard
+# pages). Generalizes CRAVING_PRODUCERS (demand -> station) to the resource
+# layer: every tap-cost resource maps to the stations spending it, the
+# monster families generating it over time, the station raising its cap,
+# and other sources. Powers the rejection teaching ("X needs Y — Y comes
+# from Z, build/keep Z") and the resource-hint lines. made_by lists
+# board-relevant families first, late-game legendaries last.
+RESOURCE_ECONOMY = {
+    "slime": {
+        "used_by": ("Supply Cupboard", "Fridge"),
+        "made_by": ("Zombies", "Spiders", "Ghouls", "Slime Golems",
+                    "Serv-O", "Gorgon", "Cyclops", "The Colossus",
+                    "Shield Bot"),
+        "cap_by": "Slime Vats",
+        "also": "feeding Potions",
+    },
+    "mana": {
+        "used_by": ("Grave", "Lectern"),
+        "made_by": ("Skeletons", "Eye Monsters", "Banshees", "Mana Golems",
+                    "Serv-O", "Lich", "Reaper", "The Cursed", "Shield Bot"),
+        "cap_by": "Mana Pools",
+        "also": "feeding Potions and tapping the NecroMerger (collect)",
+    },
+    # Darkness is the late-game tap-cost resource (Altar unlocks at Tier 7
+    # feats; Portal later). No live plumbing reads it yet — no HUD reader,
+    # no validator gate, no hint trigger — so this entry is knowledge-only
+    # until the save reaches it (then: darkness reader + threshold +
+    # DARKNESS_SPAWN_PREFIXES gate mirroring the cupboard path). Banked now
+    # so the teaching and rates are ready, with zero behavior change.
+    "darkness": {
+        "used_by": ("Altar", "Portal"),
+        "made_by": ("Mummies", "Bats", "Imps", "Darkness Golems",
+                    "Serv-O", "Harpy", "Archdemon", "The Infernal",
+                    "Shield Bot"),
+        "cap_by": "Darkness Stores",
+        "also": "feeding Shades or Potions",
+    },
+}
+# Validator rejection reason -> tap-cost resource it ran out of. Lets the
+# correction and the folded learnings name the producers (via
+# _resource_teaching) instead of just saying "wait until it regenerates".
+RESOURCE_REJECTION = {
+    "spawn_no_slime": "slime",
+    "spawn_low_mana": "mana",
+}
+
+
+def _resource_teaching(resource: str, short: bool = False) -> str:
+    """Producer teaching sentence for a tap-cost resource (single source).
+
+    Full form goes to the folded learnings rule (permanent knowledge);
+    short form to the in-step correction and board-hint lines. Both are
+    built from RESOURCE_ECONOMY so the facts can't drift apart.
+    """
+    cfg = RESOURCE_ECONOMY.get(resource or "", {})
+    if not cfg:
+        return ""
+    makers = ", ".join(cfg["made_by"])
+    if short:
+        return (f"{resource.capitalize()} comes from {makers} on the "
+                f"board — keep them; {cfg['cap_by']} raise the cap.")
+    return (f"{resource.capitalize()} is generated over time by {makers} "
+            f"on the board — keep and merge them, never feed your "
+            f"generators when {resource} is low. {cfg['cap_by']} raise "
+            f"the cap. Also: {cfg['also']}.")
 # (vision/panels.py) only handles 4 stations because the Station panel dialog
 # never needs to disambiguate the rest. The strategy classifier needs the
 # full list because the wiki has feats for every station. The canonical
@@ -171,17 +318,76 @@ STRATEGY_REFRESH_STEPS = 15 # a committed strategy expires (re-offer) after this
 STRATEGY_KIND_BONUS = 1.0   # weight added to the strategy objective's move kind
 MAX_BUYS = 1                # buy_station attempts allowed per step (spends runes)
 MAX_QUEUE = 1               # collect_queue placements allowed per step (board mutation)
+OBSERVE_HEARTBEAT_STEPS = 10  # live get_board_state call every N steps; others inject the deterministic render
 PENDING_BUY_TTL = 5         # a confirm=false buy auto-expires after this many steps
 
-def _drive_prompt(geom: GridGeometry) -> str:
-    """System prompt for vision-drive; board geometry rendered from detection."""
+HARD_RULES_TEXT = """HARD RULES (every violation is rejected — do not test them):
+1. Merge ONLY two cells with the SAME id; NEVER merge [NEVER MERGE] / (max level) cells.
+2. Spawn ONLY on [SPAWNABLE] cells (grave needs Mana + room; chest needs room; cupboard needs Slime + room and an eye objective) — never on runes, creatures, or full boards.
+3. Feed ONLY [FEEDABLE] cells; never feed stations, champions, or the NecroMerger.
+4. Attack ONLY as your creature (with dmg N) -> champion cell; a champion is NEVER the attacker.
+5. get_board_state / identify_item / buy_station / set_strategy are TOOLS, not actions — never output them.
+
+Example legal move: {"action": "feed", "cell": [1,0]} where (1,0) is tagged [FEEDABLE].
+Example illegal move (always rejected, do not repeat this shape): {"action": "merge", "a": [1,0], "b": [3,2]} where both cells are tagged [NEVER MERGE] — the validator refuses merge_max_level and the game no-ops."""
+
+
+def _geom_header(geom: GridGeometry) -> str:
     x0, y0 = geom.origin_x, geom.origin_y
     x1, y1 = x0 + geom.cols * geom.cell_px, y0 + geom.rows * geom.cell_px
-    return f"""You are the brain of a bot playing NecroMerger on a {geom.rows}x{geom.cols} board.
+    return (f"""You are the brain of a bot playing NecroMerger on a {geom.rows}x{geom.cols} board.
 The screenshot is {SCREEN[0]}x{SCREEN[1]} pixels, full emulator frame.
 Board geometry: the board occupies pixels x={x0}-{x1}, y={y0}-{y1};
 {geom.rows} rows x {geom.cols} columns, each cell {geom.cell_px}px square. Top-left cell is (0,0), top-right (0,{geom.cols-1}),
-bottom-left ({geom.rows-1},0), bottom-right ({geom.rows-1},{geom.cols-1}). The Devourer's mouth is above the board at ~({geom.mouth_x},{geom.mouth_y}).
+bottom-left ({geom.rows-1},0), bottom-right ({geom.rows-1},{geom.cols-1}). The Devourer's mouth is above the board at ~({geom.mouth_x},{geom.mouth_y}).""")
+
+
+def _action_schema(geom: GridGeometry) -> str:
+    return f"""Then look at the screenshot, decide the single best move, and reply with ONLY a
+JSON object using EXACTLY one of these actions:
+{{"action":"merge","a":[r,c],"b":[r,c]}}
+{{"action":"spawn","cell":[r,c]}}
+{{"action":"feed","cell":[r,c]}}
+{{"action":"attack","cell":[r,c],"target":[r,c]}}
+{{"action":"collect"}}
+{{"action":"idle"}}
+r is the row (0-{geom.rows-1}), c is the column (0-{geom.cols-1}). merge: pick two
+cells holding the SAME item (identical sprites, same id, same level). spawn: on
+a spawn station (grave — costs Mana; or chest — mana-free, one Rune per
+tap; the chest on the board is a `spawn` cell, not a `collect` cell).
+attack: drag one of YOUR creatures (a non-champion, non-station cell with a
+known `(dmg N)` value) onto a Champion cell (a cell labeled `(champion)` in
+get_board_state — e.g. The Peasant) to deal that creature's `(dmg N)` HP to
+the Champion. The `cell` (attacker) is ALWAYS one of YOUR creatures — a
+Champion can NEVER be the attacker (the validator refuses `attack_is_champion`),
+only the `target` is the Champion. Per observation, Champions do not
+auto-attack; only your attack drags deal damage. If no creature on the board
+has a known `(dmg N)` value, attack is not available; merge/feed instead.
+collect: tap the NecroMerger at (0,{geom.cols-1}) to gain Mana. It does NOT
+remove the NecroMerger, does NOT clear or free a board cell, and you cannot
+"collect" any other item — chests and stations (Grave, Mana Pool, etc.)
+and creatures are never "collected" (use `spawn` for a chest, `feed`
+for a creature, `buy_station` for a station).
+feed: drag a creature into the Devourer's mouth. Never feed any station
+(the station list above) and never the NecroMerger.
+Do not explain, just output the JSON object."""
+
+
+def _answer_prompt(geom: GridGeometry) -> str:
+    """Minimal system prompt for the answer round (_ask_once).
+
+    The full _drive_prompt (~25k chars) is needed for the tool rounds, but
+    the final JSON decision only needs geometry + hard rules + schema.
+    Per-cell legality tags, the whitelist, the Best hints, and the decision
+    checklist all arrive via the Tool-results text, so nothing is lost —
+    and the 4B model decides with ~2k chars of instruction instead of ~25k.
+    """
+    return _geom_header(geom) + "\nRules:\n" + HARD_RULES_TEXT + "\n" + _action_schema(geom)
+
+
+def _drive_prompt(geom: GridGeometry) -> str:
+    """System prompt for vision-drive; board geometry rendered from detection."""
+    return _geom_header(geom) + """
 Rules:
 - Two identical items merge into one of the next level (e.g. zombie_lvl1 + zombie_lvl1 -> zombie_lvl2).
 - The LEVEL is part of an item's identity: creatures of the SAME type but DIFFERENT
@@ -193,22 +399,10 @@ Rules:
   info popup says only "Feed to the Devourer." and has NO "merge" line —
   it can never merge again. When `get_board_state` marks a cell
   `(max level)`, do NOT try to merge two of them — the game refuses.
-  Feeding one yields good food, but feeding is NOT its only use: max-level
-  creatures GENERATE RESOURCES (Mana, Slime, Darkness — the 3 resources
-  that spawning stations consume to produce items, distinct from the 5
-  Runes that buy new stations) while on the board (higher levels
-  generate more, and the wiki's Mana-generator category includes the
-  Lich, Reaper, and other Legendary minions). The bone -> ribcage ->
-  skeleton_lvl1 -> ... -> skeleton_lvl7 chain is a CREATURE CHAIN, not
-  a max-level progression: each link is a separate mergeable id, and the
-  wiki treats them all as `Mana generators` (not just the top). The
-  Ancient Tablet / Forgotten Minions / Legendary crafting (Floating
-  Skull, Revenant, Lich, etc.) is a LATE-GAME system accessed via the
-  Feats Tab — the bot can't reach it on the current save, so don't plan
-  around it; keep high-level generators because they passively make
-  their resource, not because of a future crafting recipe you can't
-  trigger yet. Decide per situation: feed for Food/space when needed;
-  keep high-level generators when resource income matters.
+   Feeding one yields good food, but feeding is NOT its only use: max-level
+   creatures GENERATE RESOURCES (Mana, Slime, Darkness) while on the board
+   (higher levels generate more). Decide per situation: feed for Food/space
+   when needed; keep high-level generators when resource income matters.
 - SPAWNING — GRAVE: a Grave spawns bone/ribcage when tapped — it costs Mana
   (the amount grows with the station's level) and silently does nothing when
   the bar is empty, so do NOT spawn the grave when `get_board_state` shows
@@ -237,19 +431,11 @@ Rules:
   feedable exists; merge the stack up first so the per-feed payout is
   the largest (icerune lvl3 grants 12 vs lvl1's 2; coin lvl4 grants 30
   vs lvl1's 2).
-  WHEN to tap a chest: only when the resulting rune is going to feed into
-  a stack that reaches max level and gets fed within a few steps. Tap when
-  (a) you have NO Runes of that type on the board yet (start a new stack),
-  (b) you have low-level Runes of that type and the new rune can be merged
-  into them (saves a spawn slot), or (c) the existing stack is one or two
-  merges away from max level and a fresh rune would push it over. DO NOT
-  tap the chest just because it has uses and there's an empty cell — a
-  bare board with a chest doesn't need 4 level-1 Runes in a row; the
-  runes accumulate faster than you can merge them up, and each tap uses
-  a cell. Don't tap when the board is full of `(max level)` items — the
-  spawn just clogs a cell with a Rune you can't use. If the only Rune of
-  that type is already at max level on the board, the new spawn doesn't
-  help (you'd have to start a new stack from level 1).
+   WHEN to tap a chest: only when the rune feeds a stack that reaches max
+   level and gets fed within a few steps — a new stack, a mergeable stack,
+   or one or two merges from max. Do NOT tap just because uses remain:
+   runes accumulate faster than they merge, and each tap costs a cell.
+   Never tap when the board is full of `(max level)` items.
 - RESOURCE BAR: `get_board_state` shows the current Resource fill as
   `Mana: ~N% full` (the only Resource bar visible on the lair for now —
   Slime and Darkness bars appear later when Slime Vat / Dark Stores are
@@ -328,37 +514,25 @@ Rules:
   removes a member of a future merge pair, so the `Best feed:` hint
   avoids them when a non-material or craved target exists. (See
   FEED-TO-PROGRESS above for the full feed-selection policy.)
-- The Devourer may have an active CRAVING (unlocked at Devourer Level 3; a
-  second slot at Lvl 21, a third at Lvl 41): a small bubble above the board
-  shows the craved creature, and a Food bonus is granted ONCE when the
-  craving's quota is fulfilled (the final feed pays out the bonus on top
-  of the item's normal food). The craving is a strong priority: if a
-  creature matching the current craving at the EXACT craving level is
-  on the board, FEED it — it counts toward the quota — unless a
-  nearly-done feat of another kind outranks it (see MOVE PRIORITY
-  below). Precursors of the craved item (same family, lower level —
-  e.g. `bone`/`ribcage` for a `Skeleton (lvl 1)` craving) must NOT be
-  fed; they are the recipe to build the craved monster. Cells ABOVE
-  the craving's level can also be fed (they can't merge down). `get_
-  board_state` shows the current craving as `Cravings: <item> (lvl <N>)
-  <count_done>/<count_required>, reward +<food>` (each craving is a
-  single item + level + count, not a multi-item objective); when no
-  craving is shown there, call `get_cravings` to read it. The craved
-  item is a regular creature (e.g. Skeleton lvl 1, Rib Cage, Zombie
-  lvl 2, Eye Monster lvl 1) — never a station, and the NecroMerger
-  itself is never the craving. EXCEPTION: when the bar is so full that
-  feeding the craved item would overflow past the satiety tolerance,
-  do NOT feed it (see the CRAVING OVERFLOW rule) — spawn to rebuild
-  it instead.
+- The Devourer may have an active CRAVING (bubble above the board; Food bonus
+  granted ONCE when the quota is fulfilled). If a creature matching the
+  craving at the EXACT level is on the board, FEED it — unless a
+  nearly-done feat of another kind outranks it (see MOVE PRIORITY), or the
+  bar is so full the feed would overflow past tolerance (see CRAVING
+  OVERFLOW — spawn to rebuild it instead). NEVER feed a same-family
+  LOWER-level precursor (it merges up into the craved monster); cells AT
+  or ABOVE the craving's level feed normally. `get_board_state` shows
+  `Cravings: <item> (lvl <N>) <done>/<required>, reward +<food>`; when no
+  craving is shown, call `get_cravings` to read it. The craved item is
+  never a station and never the NecroMerger.
 - NEVER feed any station to the Devourer. The wiki's stations are:
   Grave, Mana Pool, Supply Cupboard, Foul Chicken, Slime Vat, Altar,
   Dark Stores, Lectern, Fridge, Portal, Crashed Saucer, Telepad, Soul
   Grinder, Prism, Unexpected Parcel, Meteor, Throne (plus post-prestige
-  additions). The game itself permits feeding most stations behind a
-  confirmation dialog (your LAST Grave and the NecroMerger are exempt
-  — feeding those shows no dialog and the action is silently no-op),
-  but we never risk it. The NecroMerger is never fed, spawned, or
-  collected.
+  additions) — this is the canonical list, referenced as "the station
+  list" elsewhere. The game itself permits feeding most stations behind a
+  confirmation dialog, but we never risk it. The NecroMerger is never fed,
+  spawned, or collected.
   MERGING stations is normal and valid: two identical manapools, Graves,
   etc. merge into the next level (e.g. manapool_lvl1 + manapool_lvl1 ->
   manapool_lvl2) exactly like any other item pair. So the Mana Pool is
@@ -410,23 +584,11 @@ Rules:
   `collect` when the mana bar is full. `get_board_state` may also show
   a `Champion:` line (next champion to spawn + progress); when a
   champion is on the board, the attack branch becomes live.
-- The bottom of the lair screen has a dock of 5 buttons: Feats (your active
-  feat tier, 4 missions per tier), Station (buy stations from the Station
-  panel — the wiki has 17 stations: Grave, Mana Pool, Supply Cupboard,
-  Foul Chicken, Slime Vat, Altar, Dark Stores, Lectern, Fridge, Portal,
-  Crashed Saucer, Telepad, Soul Grinder, Prism, Unexpected Parcel,
-  Meteor, Throne), Queue (rewards from feats/leveling — a placement
-  action, not a panel; see `collect_queue` below), Spellbook (semi-
-  permanent upgrades bought with Runes — 6 pages, unlock at Devourer
-  levels 14/26/39/58/76/88), Shop (in-game store for Gold Coins + Gems;
-  chests and stations refresh every 8 hours; some trades require a
-  Devourer level or Prestige). `get_board_state` shows the live dock
-  state in a `Bottom bar:` line — trust that, not this static description.
-  Locked buttons look dim and unclickable; unlocked are bright. These
-  dock buttons open panels — they are NOT board moves, so never tap them
-  via a merge/feed/spawn action. The Queue is different: tapping it
-  DROPS its queued reward item onto the board (a placement action, not
-  a readable panel), so leave it alone unless you want the item placed.
+- The bottom of the lair screen has a dock of 5 buttons: Feats, Station,
+  Queue (placement action — tapping DROPS the queued reward onto the
+  board, so leave it alone unless you want the item placed), Spellbook
+  and Shop (both locked). `get_board_state` shows the live dock state in
+  a `Bottom bar:` line — trust that, not this static description.
    A missing `Bottom bar:` line means a panel or non-lair screen is open,
    so the dock is hidden.
 - POTIONS (manapot / manapotion): max-level Potions (e.g. `manapotion_lvl3`,
@@ -473,15 +635,11 @@ locks in the right id. Only call `identify_item` when a cell is
 UNIDENTIFIED (no template label) — never for cells that already show a
 label you don't recognize (the label is the truth; the sprite is the
 lie).
-And `get_cravings` opens the Cravings menu to read the Devourer's current
-craving (item, level, progress, reward) so you can prioritize feeding the
-craved creature. The current craving is already shown in `get_board_state`
-from a recent menu read — only call `get_cravings` when the board state
-shows no craving, or you need an updated progress count.
-`tap_button` opens a dock panel (FEATS or STATION) and reports what it
-shows — the current feats are ALSO shown in `get_board_state` from a
-recent read; use `tap_button` when you need the full panel or fresh
-progress. It is read-only and refuses locked/Queue buttons.
+And `get_cravings` reads the current craving — `get_board_state` already
+shows it from a recent read, so only call when none is shown or progress
+is stale. `tap_button` opens a dock panel (FEATS or STATION), read-only;
+the feats are ALSO in `get_board_state`, so use it only for the full
+panel or fresh progress.
 And `set_strategy` is YOUR strategic voice: commit to ONE active feat OR a meta-goal,
 and the priority layer boosts YOUR choice for ~15 steps instead of the
 closest-to-done default. When feats compete or you see a better long-
@@ -530,90 +688,26 @@ STRATEGY TYPES:
 
 The `target_family` field replaces `target_item` for station/meta-goal strategies.
 For creature feats, you may still use `target_item` (e.g. `skeleton_lvl3`).
-And `buy_station` spends RUNES (the 5 currencies are ice, poison, blood,
-moon, death — the Station panel's top bar shows these 5 runes left-to-
-right) to place a NEW station on the board. Two identical stations then
-merge to the next level exactly like creatures, so buying a second Grave
-is how you grow spawn capacity. Two-phase (ENFORCED): call with
-confirm=false to check affordability and read the confirmation dialog's
-station + cost; the system stashes a pending buy. The next call MUST be
-buy_station(<same family>, confirm=true) to complete it, or the pending
-buy auto-expires after a few steps. Calling confirm=true with no matching
-pending buy is rejected. Only confirm purchases that serve your strategy
-— if your set_strategy targeted a specific station, buy_station refuses
-any other family with `strategy_mismatch`. The way to GATHER Runes is
-feeding Rune stacks to the Devourer — feeding a max-level icerune stack
-grants Ice Runes, poisonrune grants Poison Runes, bloodrune grants Blood
-Runes, etc. (max-level stacks grant more of their Rune; the bot's
-`Best income:` hint fires for any of the 5 Rune families under a build
-strategy). The loop is: tap chests ON THE BOARD with the `spawn` action
-(collect_queue is for the dock Queue button, NOT board chests — see
-`collect_queue` below) to release Runes, MERGE the stacks up to max
-level, then FEED the max-level stack — and repeat until you can afford
-the purchase. The buy_station result reports your current Rune balances
-under "currency" so you can plan.
-And `collect_queue` places the reward queued in the bottom-bar Queue button
-onto the board (the button shows the queued item; a bare skull means empty).
-Placement is REFUSED when the board is congested — each placed reward
-occupies a cell. The dock Queue button is different from a chest on the
-board: chests on the board are spawn stations (tap with the `spawn` action
-— see the SPAWNING — ICE CHEST bullet above for details); the dock Queue
-button drops whatever reward is queued into it (a feat reward, a level-up
-chest, a Rune pile — the kind of item the bot doesn't want to auto-tap
-because each placement occupies a cell). The Runes released by chests
-merge up like any item (each Rune family has its own chain; icerune goes
-lvl1 -> lvl2 -> lvl3 max) and MAX-LEVEL stacks are the Rune currency
-source — merge ranking prioritizes them for exactly that reason. Feed
-only the max-level stack.
+And `buy_station` spends RUNES (ice, poison, blood, moon, death) to place
+a NEW station. Two-phase (ENFORCED): confirm=false reads the dialog and
+stashes a pending buy; the next call MUST be confirm=true (same family)
+or it auto-expires. Only confirm purchases serving your strategy
+(`strategy_mismatch` refuses other families). GATHER Runes by feeding
+max-level Rune stacks (see ICE CHEST above; the `Best income:` hint fires
+under a build strategy). Full semantics are in the tool description —
+this is the summary.
+And `collect_queue` places the dock Queue button's reward onto the board
+(bare skull = empty); REFUSED when congested. Board chests are different:
+they are spawn stations — tap with `spawn` (see ICE CHEST). Full
+semantics are in the tool description.
 
-Then look at the screenshot, decide the single best move, and reply with ONLY a
-JSON object using EXACTLY one of these actions:
-{{"action":"merge","a":[r,c],"b":[r,c]}}
-{{"action":"spawn","cell":[r,c]}}
-{{"action":"feed","cell":[r,c]}}
-{{"action":"attack","cell":[r,c],"target":[r,c]}}
-{{"action":"collect"}}
-{{"action":"idle"}}
-r is the row (0-{geom.rows-1}), c is the column (0-{geom.cols-1}). merge: pick two
-cells holding the SAME item (identical sprites, same id, same level). spawn: on
-a spawn station (grave — costs Mana; or chest — mana-free, one Rune per
-tap; the chest on the board is a `spawn` cell, not a `collect` cell).
-attack: drag one of YOUR creatures (a non-champion, non-station cell with a
-known `(dmg N)` value) onto a Champion cell (a cell labeled `(champion)` in
-get_board_state — e.g. The Peasant) to deal that creature's `(dmg N)` HP to
-the Champion. The `cell` (attacker) is ALWAYS one of YOUR creatures — a
-Champion can NEVER be the attacker (the validator refuses `attack_is_champion`),
-only the `target` is the Champion. Per observation, Champions do not
-auto-attack; only your attack drags deal damage. If no creature on the board
-has a known `(dmg N)` value, attack is not available; merge/feed instead.
-collect: tap the NecroMerger at (0,{geom.cols-1}) to gain Mana. It does NOT
-remove the NecroMerger, does NOT clear or free a board cell, and you cannot
-"collect" any other item — chests and stations (Grave, Mana Pool, etc.)
-and creatures are never "collected" (use `spawn` for a chest, `feed`
-for a creature, `buy_station` for a station).
-feed: drag a creature into the Devourer's mouth. Never feed any station
-(Grave, Mana Pool, Supply Cupboard, Foul Chicken, Slime Vat, Altar, Dark
-Stores, Lectern, Fridge, Portal, Crashed Saucer, Telepad, Soul Grinder,
-Prism, Unexpected Parcel, Meteor, Throne — full wiki list above) and
-never the NecroMerger.
-Do not explain, just output the JSON object."""
+""" + HARD_RULES_TEXT + "\n\n" + _action_schema(geom)
 
 BOARD_TOOL = {
     "type": "function",
     "function": {
         "name": "get_board_state",
-        "description": (
-            "Return the live board state: every occupied cell with its item id "
-            "(template-bank label, e.g. `skeleton_lvl2`), level, confidence "
-            "score, and any per-cell tags `(max level)` / `(champion)` / "
-            "`(feed N)` / `(dmg N)`; a list of occupied cells the detector "
-            "could not identify (candidates for identify_item); the empty-cell "
-            "count; the mana bar fill; the active cravings; the active strategy; "
-            "the feat list with each task's action kind and progress; the bottom "
-            "bar state; and one or more `Best ...:` hints for the single highest-"
-            "priority move under the current feats + craving. The bot calls this "
-            "automatically each step; you may also call it yourself for a fresher "
-            "read."),
+        "description": "Return the live board state text.",
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
 }
@@ -795,6 +889,30 @@ BUY_TOOL = {
     },
 }
 
+# Short compel-time spec for _compel_buy (same parameters, minimal
+# description). Probed live: this thinking model burns its whole budget
+# debating the full two-phase/affordability/mismatch semantics and emits
+# nothing, but emits a perfect call for a single-action positive framing.
+# The full BUY_TOOL stays on the voluntary optional-tools round, where the
+# semantics guide deliberate calls.
+BUY_TOOL_SHORT = {
+    "type": "function",
+    "function": {
+        "name": "buy_station",
+        "description": "Read a station card from the Station panel and report its cost.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "family": {"type": "string",
+                           "description": "station family, e.g. 'grave'"},
+                "confirm": {"type": "boolean",
+                            "description": "false reads the dialog, true completes"},
+            },
+            "required": ["family"],
+        },
+    },
+}
+
 QUEUE_TOOL = {
     "type": "function",
     "function": {
@@ -811,6 +929,23 @@ QUEUE_TOOL = {
             "Devourer grants the Ice Rune currency (no food) — your main "
             "rune income: spawn chests, merge the stacks up, feed the max-"
             "level stack, repeat. Only available in live mode."),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+FEAT_COLLECT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "collect_feat_rewards",
+        "description": (
+            "Open the Feats panel and collect any completed feat rewards "
+            "(blue Collect buttons with a red badge, plus the green tier "
+            "reward when its badge is up). Each tap is verified and bounded. "
+            "Use when get_board_state shows a feat as done but its reward "
+            "is still unclaimed, or when you have just completed a mission. "
+            "The periodic background collect runs every 5 steps when a done "
+            "feat is cached, but this tool lets you force an immediate "
+            "collect without waiting. Only available in live mode."),
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
 }
@@ -878,7 +1013,7 @@ def _synthesize_buy_call(content: str, family: str) -> dict | None:
         return None
     if not isinstance(data, dict) or data.get("action") != "buy_station":
         return None
-    args = {"family": data.get("family") or family,
+    args = {"family": canonical_family(data.get("family")) or family,
             "confirm": bool(data.get("confirm", True))}
     return {"type": "function",
             "id": f"synth_buy_{int(time.time() * 1000)}",
@@ -934,8 +1069,7 @@ class VisionDrivenPlanner(Planner):
                  champions: ChampionReader | None = None,
                  hints: bool = True,
                  shop=None,
-                 queue_box=None,
-                 strategy_interval: int = 20):
+                 queue_box=None):
         super().__init__()
         # live=False (static --screenshot regression runs) must be genuinely
         # offline: no default client construction, so a running llama server
@@ -983,11 +1117,24 @@ class VisionDrivenPlanner(Planner):
         self.fallback.slime_count = None      # per-step slime vat count (HUD digit)
         self.fallback.slime_capacity = None    # per-step slime vat max (popup-OCR or default)
         self._feats_cache = None       # last FEATS panel read: {tier, feats, step}
+        self._last_feat_collect_step = -1000  # step of last feat collect attempt (for opportunistic retry)
+        self._last_feat_collect_found = True  # did it collect anything (skip stale re-tries)
+        self._defer_panel_reads = False  # set per-step: a buy will open the panel, skip scheduled feats reads
+        self._answer_system = None     # short decision prompt for _ask_once (set per-step in _drive)
+        self._compel_misfires = {}     # family -> consecutive compelled buys with no effect (backoff)
+        self._unbanked_votes = {}      # (row,col) -> name votes for consensus banking
+        # Popup-label persistence (Sep 7): eyeball vs eyemonster_lvl1 are
+        # template-indistinguishable (cross-bank matches ~1.0 both ways), so
+        # the classifier coin-flips every step and no bank growth can fix
+        # it. A popup read is ground truth for that cell until the cell
+        # genuinely changes — persist {(row,col): (item_id, step)} and
+        # re-apply over a template label inside the ambiguous pair (see
+        # apply_label_memory). Scoped to the pair: any other template
+        # label, an empty cell, or a cell touched by our move drops the
+        # entry; entries also expire after LABEL_MEMORY_TTL steps.
+        self._label_memory: dict[tuple, tuple] = {}
         self._strategy = None          # model-committed objective: {feat, target, step}
         self._strategy_family = None   # family the strategy says to build (for buy_station validation)
-        # Strategy planner (System 2) - runs periodically to set strategy
-        self.strategy_planner = create_strategy_planner(self) if self.client else None
-        self._strategy_interval = strategy_interval
         # The two-phase buy state lives on self.shop._pending_buy (set inside
         # StationShop.buy when confirm=false stages the dialog). The planner
         # reads it via that attribute; no local copy needed.
@@ -996,6 +1143,7 @@ class VisionDrivenPlanner(Planner):
         self._last_summary_t = self._session_start   # events at/after this are un-summarized
         self._step_count = 0
         self._turn = 0                                # API round counter within this planner
+        self._step_llm_rounds = 0                   # LLM rounds this step (llm_budget telemetry)
         # cross-step rejection memory. The previous per-step `rejected`
         # set was cleared at the start of each `_drive` call, so the model saw
         # the same rejected feed/merge every step until something else on the
@@ -1088,11 +1236,6 @@ class VisionDrivenPlanner(Planner):
             if self._step_count - rec.get("step", self._step_count) < CROSS_STEP_TTL
             and self._cross_step_rejection_still_valid(rec, board)
         ] if self._cross_step_rejected else []
-        # System 2: Strategy planner - run periodically to set strategy
-        if (self.strategy_planner is not None
-                and self.strategy_planner.should_run(self._step_count)):
-            self._run_strategy_planner(board, frame)
-
         self._cross_step_rejected = [
             rec for rec in self._cross_step_rejected
             if self._step_count - rec.get("step", self._step_count) < CROSS_STEP_TTL
@@ -1125,6 +1268,7 @@ class VisionDrivenPlanner(Planner):
         # this stays None until a menu read lands — craved feeds then fall back
         # to the conservative low-tier gate (CRAVED_UNKNOWN_LEVEL_MAX).
         self.fallback.craved_level = (self._craving_cache or {}).get("level")
+        self.fallback.craved_need = self._craving_need_remaining()
         self._last_craving_level = self.fallback.craved_level
         self._satiety_context(frame)
         # Feat-driven priorities (from the cached FEATS read + the craving
@@ -1140,12 +1284,41 @@ class VisionDrivenPlanner(Planner):
         # Income feeds target the MAX-LEVEL stack (largest Ice grant) — a lvl1
         # icerune feed wastes the economy. Feat-target prefers stay cheapest.
         self.fallback.feed_prefer_max = income is not None
+        # Panel-visit economy: at most one scheduled panel cycle per step.
+        # A buy (pending confirm, affordable/cold-start strategy or craving
+        # need) will open the Station panel in the optional round — when it
+        # will, skip this step's scheduled FEATS read/collect so the step
+        # costs one panel cycle instead of two. Pure cache reads, no taps.
+        self._defer_panel_reads = self._want_buy_this_step(board)
         if frame is None:
             self.log.log("vision_drive", ok=False, reason="no_frame")
             move = self.fallback.next_move(board, frame)
             self._record_feed_context(move, board)
             self._log_move_outcome(move, success=True, board=board)
             return move
+        # Queue auto-collect (code-driven, not model-driven): the model
+        # never emits native tool calls on this stack, so collect_queue can
+        # never fire voluntarily (observed: zero queue_collected in 3329
+        # lines). When a reward is queued AND the board has room, place it
+        # BEFORE planning so _drive sees the post-placement board. The
+        # placed cell is patched occupied (with the item id when known) to
+        # keep this step's planning consistent; next step re-classifies.
+        # Congested boards skip (collect would refuse anyway); errors log
+        # as queue_collect_miss instead of stalling the step.
+        self._auto_collect_queue(board, frame)
+        # Ad-offer observer (detect-only, never taps): a locked chest on
+        # the board is the only grounded ad trigger ("watch an advert to
+        # unlock"). Log sightings so the watch→claim cycle can be built
+        # once real offer UI is captured. See vision/ads.py.
+        try:
+            if any((c.item_id or "").startswith("lockedchest")
+                   for c in board.cells if c.occupied):
+                from vision.ads import detect_ad_offer
+                offer = detect_ad_offer(frame, True)
+                if offer:
+                    self.log.log("ad_offer_seen", text=offer.get("text"))
+        except Exception:
+            pass
             # don't fall back to the heuristic on retry exhaustion. The
         # previous path caught ValueError (raised when `_drive` exhausts
         # max_retries) and ran the heuristic, which silently substituted a
@@ -1176,103 +1349,15 @@ class VisionDrivenPlanner(Planner):
                 move = Move(kind="idle")
         self._record_feed_context(move, board)
         self._log_move_outcome(move, success=True, board=board)
-        return move
-
-    def _run_strategy_planner(self, board, frame) -> None:
-        """Run the System 2 strategy planner to evaluate and commit a strategy."""
-        if self.strategy_planner is None:
-            return
+        # Per-step LLM round telemetry (log-only, no behavior change):
+        # every client round flows through _log_chat, so the count bounds
+        # future budget enforcement and diagnoses slow steps today.
         try:
-            feat = self.strategy_planner.plan(board, frame)
-            if feat:
-                self.log.log("strategy_planner", feat=feat, step=self._step_count)
-        except Exception as exc:
-            self.log.log("strategy_planner_error", error=str(exc))
-        self.strategy_planner._last_run_step = self._step_count
-
-        self._cross_step_rejected = [
-            rec for rec in self._cross_step_rejected
-            if self._step_count - rec.get("step", self._step_count) < CROSS_STEP_TTL
-            and self._cross_step_rejection_still_valid(rec, board)
-        ] if self._cross_step_rejected else []
-        self._noop.tick()
-        # pending-buy expiry. A confirm=false call starts the
-        # two-phase buy; if the model never calls confirm=true, the
-        # pending buy auto-expires after PENDING_BUY_TTL steps so a
-        # future confirm=true can't accidentally complete a stale
-        # dialog from a long-forgotten attempt.
-        # Read from self.shop — StationShop sets _pending_buy on its own
-        # attribute, so the planner's local _pending_buy is always None.
-        # Proxy via the shop to keep this check in sync.
-        pending = self.shop._pending_buy if self.shop is not None else None
-        if (pending
-                and self._step_count - pending.get("step", 0)
-                > PENDING_BUY_TTL):
-            self.log.log("buy_pending_expired",
-                         family=pending.get("family"),
-                         age=self._step_count - pending.get("step", 0))
-            if self.shop is not None:
-                self.shop._pending_buy = None
-        self.fallback.max_level_ids = self._max_level_ids()
-        self.fallback.chain_map = self._chain_map()
-        self.fallback.feed_values = self._feed_values()
-        self.fallback.damage_values = self._damage_values()
-        # Level-aware craving: the authoritative level comes from the last full
-        # menu read (`get_cravings`). The bubble cue alone has no level, so
-        # this stays None until a menu read lands — craved feeds then fall back
-        # to the conservative low-tier gate (CRAVED_UNKNOWN_LEVEL_MAX).
-        self.fallback.craved_level = (self._craving_cache or {}).get("level")
-        self._last_craving_level = self.fallback.craved_level
-        self._satiety_context(frame)
-        # Feat-driven priorities (from the cached FEATS read + the craving
-        # + the income objective when a build strategy is active and an
-        # icerune stack is on the board).
-        weights = self._feat_weights(board)
-        self.fallback.feat_weights = weights
-        max_level_ids = self._max_level_ids()
-        income = income_objective(self._strategy, board, max_level_ids)
-        self.fallback.feed_objective_active = self._feed_objective_active() or income is not None
-        self.fallback.feed_prefer_item = (
-            income.target if income is not None else weights.get("feat_target"))
-        # Income feeds target the MAX-LEVEL stack (largest Ice grant) — a lvl1
-        # icerune feed wastes the economy. Feat-target prefers stay cheapest.
-        self.fallback.feed_prefer_max = income is not None
-        if frame is None:
-            self.log.log("vision_drive", ok=False, reason="no_frame")
-            move = self.fallback.next_move(board, frame)
-            self._record_feed_context(move, board)
-            self._log_move_outcome(move, success=True, board=board)
-            return move
-            # don't fall back to the heuristic on retry exhaustion. The
-        # previous path caught ValueError (raised when `_drive` exhausts
-        # max_retries) and ran the heuristic, which silently substituted a
-        # move the model never agreed to. The model couldn't see why its
-        # output kept getting overridden. We now let the retry-exhaustion
-        # propagate and convert it to an `idle` move here, so the next
-        # step gets a fresh attempt with the rejected-set cleared.
-        # LLMError (network / API down) still falls back — the heuristic is
-        # the only option when there's no LLM response at all.
-        try:
-            move = self._drive(board, frame)
-        except LLMError as exc:
-            self.log.log("vision_drive", ok=False, reason="llm_error", detail=str(exc))
-            move = self.fallback.next_move(board, frame)
-        except (ValueError, KeyError, TypeError) as exc:
-            import traceback
-            tb = traceback.format_exc()
-            if isinstance(exc, ValueError) and "no valid move" in str(exc):
-                # Retry exhaustion: the model produced only invalid moves.
-                # Log + idle, don't substitute a heuristic move. The next
-                # step gets a fresh attempt (the rejected set is per-step).
-                self.log.log("vision_drive", ok=False, reason="retry_exhausted",
-                             detail=str(exc))
-                move = Move(kind="idle")
-            else:
-                # Unexpected error: log + idle (also no heuristic fallback).
-                self.log.log("vision_drive", ok=False, reason=str(exc), traceback=tb)
-                move = Move(kind="idle")
-        self._record_feed_context(move, board)
-        self._log_move_outcome(move, success=True, board=board)
+            rounds = self._step_llm_rounds
+            self.log.log("llm_budget", rounds=rounds, step=self._step_count)
+        except Exception:
+            pass
+        self._step_llm_rounds = 0
         return move
 
     def _satiety_context(self, frame) -> None:
@@ -1411,10 +1496,23 @@ class VisionDrivenPlanner(Planner):
                   and e.get("event") != "learning"]
         if not window:
             return ""
+        # Cap the window: a 50-retry step emits hundreds of events, and an
+        # unbounded transcript + image blew the 240s request budget (observed
+        # llm_error timeout). The tail carries the live signal; older events
+        # in the window were already partially summarized by prior runs.
+        # (Also see main._rotate_logs for on-disk rotation.)
+        MAX_SUMMARY_EVENTS = 400
+        truncated = 0
+        if len(window) > MAX_SUMMARY_EVENTS:
+            truncated = len(window) - MAX_SUMMARY_EVENTS
+            window = window[-MAX_SUMMARY_EVENTS:]
         fallbacks = sum(1 for e in window
                         if e.get("event") == "vision_drive" and e.get("ok") is False)
         try:
-            transcript = self._session_transcript()
+            transcript = self._session_transcript(window)
+            if truncated:
+                transcript += (f"\n(earlier {truncated} events in this window "
+                               "omitted for size; tail above is complete)")
             user_content = transcript
             if frame is not None:
                 text = transcript
@@ -1447,6 +1545,13 @@ class VisionDrivenPlanner(Planner):
         data = self._split_summary(reply)
         stamp = datetime.now().strftime("%b %d, %Y %H:%M")
         title = f"{stamp} (step {self._step_count})"
+        # Mass-delete guard: a single window once listed 9 learnings for
+        # removal (and 40+ glossary blocks) while simultaneously confirming
+        # the same texts — self-contradictory output that gutted
+        # learnings.md. Contradicted removals are dropped, and each list
+        # is capped; legitimate pruning is occasional (1-2 per window).
+        data["remove"], data["confirmed"], data["remove_items"] = \
+            self._sanitize_prunes(data)
         pruned = (prune_learning(self.learnings_path, data["remove"])
                   if data["remove"] else 0)
         confirmed = (confirm_learning(self.learnings_path, data["confirmed"])
@@ -1535,8 +1640,92 @@ class VisionDrivenPlanner(Planner):
         demoted = demote_stale_learnings(self.learnings_path)
         if demoted:
             self.log.log("learning_demoted", count=demoted)
-        self._last_summary_t = time.time()
+        # Drop stale inferred glossary entries (unconfirmed guesses age
+        # out; grounded re-reads upgrade their source and exempt them).
+        try:
+            from planner.glossary import prune_inferred_entries, _get_knowledge_dir
+            kd = _get_knowledge_dir(self.glossary_path) if hasattr(self, 'glossary_path') else None
+            n_pruned = prune_inferred_entries(knowledge_dir=kd)
+            if n_pruned:
+                self.log.log("learning_pruned_inferred", count=n_pruned)
+        except Exception:
+            pass
+        self._advance_memory_watermark()
         return reply
+
+    def _advance_memory_watermark(self) -> None:
+        """Advance the summarize watermark and drop summarized RAM events.
+
+        The on-disk session.jsonl keeps everything; transcript + cross-step
+        filters already scope by watermark, so nothing reads pruned events
+        again. Shared by the full summary and the deterministic maintenance.
+        """
+        self._last_summary_t = time.time()
+        # Bound in-RAM event growth: drop summarized events (the on-disk
+        # session.jsonl keeps everything; transcript + cross-step filters
+        # already scope by watermark, so nothing reads these again).
+        try:
+            before = len(self.log.events)
+            self.log.events = [e for e in self.log.events
+                               if e.get("t", 0) >= self._last_summary_t]
+            if before > len(self.log.events):
+                self.log.log("learning_pruned_events",
+                             dropped=before - len(self.log.events))
+        except Exception:
+            pass
+
+    # Full LLM summaries run every Nth maintenance (plus session end): the
+    # per-window pattern-mining call is high-variance (it once gutted
+    # learnings.md) and can blow the 240s budget, while the deterministic
+    # folds below carry the durable signal every window.
+    MAINTAIN_PER_SUMMARY = 10
+
+    def maintain_memory(self, board=None, frame=None) -> bool:
+        """Deterministic per-window memory maintenance (no LLM call).
+
+        Folds validator rejections + rewards into learnings, demotes stale
+        entries, prunes inferred glossary guesses, advances the watermark.
+        Every MAINTAIN_PER_SUMMARY-th call (and only then) runs the full
+        LLM pattern-mining summary instead. Returns True when anything was
+        written (learnings updated) so the caller can announce it.
+        """
+        self._maintain_count = getattr(self, "_maintain_count", 0) + 1
+        if self._maintain_count % self.MAINTAIN_PER_SUMMARY == 0:
+            return bool(self.summarize_session(board, frame))
+        window = [e for e in self.log.events
+                  if e.get("t", 0) >= self._last_summary_t
+                  and e.get("event") != "learning"]
+        if not window:
+            return False
+        wrote = False
+        try:
+            if self._rejection_reasons_to_learnings():
+                self.log.log("learning", ok=True, step=self._step_count,
+                             rejection_added=True)
+                wrote = True
+        except Exception:
+            pass
+        try:
+            if self._reward_learnings():
+                self.log.log("learning", ok=True, step=self._step_count,
+                             reward_added=True)
+                wrote = True
+        except Exception:
+            pass
+        try:
+            if demote_stale_learnings(self.learnings_path):
+                wrote = True
+        except Exception:
+            pass
+        try:
+            from planner.glossary import prune_inferred_entries, _get_knowledge_dir
+            kd = _get_knowledge_dir(self.glossary_path) if hasattr(self, 'glossary_path') else None
+            if prune_inferred_entries(knowledge_dir=kd):
+                wrote = True
+        except Exception:
+            pass
+        self._advance_memory_watermark()
+        return wrote
 
     def _stored_knowledge_context(self) -> str:
         """Current stored learnings + glossary, so the summary call can prune
@@ -1599,6 +1788,36 @@ class VisionDrivenPlanner(Planner):
                 "remove": as_list(data.get("remove")),
                 "confirmed": as_list(data.get("confirmed")),
                 "remove_items": as_list(data.get("remove_items"))}
+
+    # Per-window prune caps: legitimate pruning removes 1-2 entries; a
+    # model dumping 9 learnings + 40 glossary blocks in one window while
+    # confirming the same texts is misbehaving, not maintaining.
+    MAX_REMOVE_PER_WINDOW = 3
+    MAX_REMOVE_ITEMS_PER_WINDOW = 5
+
+    @staticmethod
+    def _sanitize_prunes(data: dict) -> tuple[list, list, list]:
+        """Drop self-contradictory removals and cap prune lists.
+
+        A text appearing in both remove and confirmed (or in the window's
+        own new learnings) is a contradiction — keep it. Returns
+        (remove, confirmed, remove_items), logging nothing (caller logs
+        counts; dropped entries are visible as count deltas).
+        """
+        def norm(t: str) -> str:
+            return re.sub(r"\s+", " ", str(t or "").strip().lower())
+
+        learning_texts = {norm(l.get("text", "") if isinstance(l, dict) else l)
+                          for l in (data.get("learnings") or [])}
+        confirmed = [c for c in (data.get("confirmed") or [])]
+        confirmed_norm = {norm(c) for c in confirmed}
+        remove = [r for r in (data.get("remove") or [])
+                  if norm(r) not in confirmed_norm
+                  and norm(r) not in learning_texts]
+        remove_items = list(data.get("remove_items") or [])
+        return (remove[:VisionDrivenPlanner.MAX_REMOVE_PER_WINDOW],
+                confirmed,
+                remove_items[:VisionDrivenPlanner.MAX_REMOVE_ITEMS_PER_WINDOW])
 
 
     def _verify_learnings(self, new_learnings: list[dict]) -> list[dict]:
@@ -1720,11 +1939,16 @@ class VisionDrivenPlanner(Planner):
                 refuted.append(text)
         return supported, refuted
 
-    def _session_transcript(self) -> str:
-        """Render un-summarized session events into a compact transcript."""
-        events = [e for e in self.log.events
-                  if e.get("t", 0) >= self._last_summary_t
-                  and e.get("event") != "learning"]
+    def _session_transcript(self, events: list[dict] | None = None) -> str:
+        """Render un-summarized session events into a compact transcript.
+
+        Pass a pre-capped window (see summarize_session) to bound the
+        prompt; defaults to all un-summarized events.
+        """
+        if events is None:
+            events = [e for e in self.log.events
+                      if e.get("t", 0) >= self._last_summary_t
+                      and e.get("event") != "learning"]
         lines = []
         for e in events:
             name = e.get("event")
@@ -1746,8 +1970,12 @@ class VisionDrivenPlanner(Planner):
             raise LLMError("vision_drive: offline (static mode)")
         image_url = _encode_frame(frame, max_dim=self.vision_max_dim)
         user = {"type": "text", "text": (
-            "This is the current board. Call get_board_state, then decide the "
-            "single best move and reply with only the JSON action object.")}
+            "This is the current board. The board state is already provided "
+            "below (see Tool results) — decide the single best move "
+            "and reply with ONLY a valid JSON action "
+            "(merge, spawn, feed, attack, collect, or idle). "
+            "There are no tools in this round — never emit a tool call "
+            "or a tool name as the action.")}
         text = _drive_prompt(board.geometry or FALLBACK_GEOMETRY)
         if self.wiki_tool:
             text += ("\nAnd `lookup_wiki` fetches a NecroMerger wiki page to "
@@ -1755,6 +1983,11 @@ class VisionDrivenPlanner(Planner):
                      "about — prefer what the board and popups tell you, and "
                      "only use it when genuinely uncertain.")
         system = text + self._learnings_context() + self._glossary_context()
+        # Short decision prompt for the answer round: the full system prompt
+        # stays on the tool rounds, but _ask_once decides from geometry +
+        # hard rules + schema only (~2k chars). Tags/whitelist/hints/checklist
+        # arrive via Tool results, so nothing is lost.
+        self._answer_system = _answer_prompt(board.geometry or FALLBACK_GEOMETRY)
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": [
@@ -1796,7 +2029,12 @@ class VisionDrivenPlanner(Planner):
                          kinds=[r["kind"] for r in self._cross_step_rejected])
         for attempt in range(1 + self.max_retries):
             msgs = list(messages)
-            for reply, correction in history:
+            # Bound retry context: each round appends ~2-4k chars, so an
+            # unbounded history overflows the context window (and buries the
+            # board state under stale corrections). The last 6 pairs carry
+            # all live signal — older rejections persist in `rejected` and
+            # `_cross_step_rejected`, which the corrections already summarize.
+            for reply, correction in history[-6:]:
                 msgs.append({"role": "assistant", "content": reply})
                 msgs.append({"role": "user", "content": correction})
             if attempt == 0 and optional is not None:
@@ -1808,10 +2046,69 @@ class VisionDrivenPlanner(Planner):
             else:
                 reply, move = self._ask_once(msgs)
             if move is None:
-                correction = ("Your reply did not contain a valid JSON action. "
-                              "Look at the board again and reply with ONLY a valid "
-                              "JSON action from the schema.")
+                # --- fixation detection ---
+                # Same reply repeated 3+ times = model is stuck (e.g.
+                # `{"action": "get_board_state"}` — the `{"action":` prefill
+                # primes the tool name the model just saw).  Emit a targeted
+                # correction that names the wrong pattern and lists valid
+                # actions, and truncate history so the wall of identical
+                # wrong replies doesn't reinforce the fixation.
+                recent_replies = [r for r, _ in history[-4:]]
+                fixation = sum(1 for r in recent_replies if r == reply)
+                # Prioritize the get_board_state hallucination: the model
+                # sees get_board_state as a tool and as a string in the
+                # prompt/board state, so it often completes '{"action":'
+                # with '"get_board_state"}' even when not fixated yet.
+                # Give a targeted correction immediately on the first
+                # occurrence rather than waiting for fixation >=2.
+                if "get_board_state" in (reply or ""):
+                    action_list = ("merge, spawn, feed, attack, collect, "
+                                   "or idle")
+                    correction = (
+                        "get_board_state is a TOOL you already called — "
+                        "it is NOT a valid action. Reply with ONLY one "
+                        "of: " + action_list + ". Example: "
+                        '{"action": "merge", "a": [2,1], "b": [2,2]}. '
+                        + self._whitelist_snippet(board, rejected))
+                    if len(history) > 4:
+                        history[:] = history[-2:]
+                elif fixation >= 2:
+                    action_list = ("merge, spawn, feed, attack, collect, "
+                                   "or idle")
+                    correction = (
+                        f"Your reply {reply[:80]!r} is not a valid "
+                        "action. Reply with ONLY one of: " + action_list
+                        + ". Example: "
+                        '{"action": "merge", "a": [2,1], "b": [2,2]}. '
+                        + self._whitelist_snippet(board, rejected))
+                    # Break pattern reinforcement: keep only the last 2
+                    # history entries so the model doesn't see 10 copies of
+                    # the same wrong answer amplifying the fixation.
+                    if len(history) > 4:
+                        history[:] = history[-2:]
+                else:
+                    correction = ("Your reply did not contain a valid JSON "
+                                  "action. Look at the board again and reply "
+                                  "with ONLY a valid JSON action from the "
+                                  "schema: merge, spawn, feed, attack, "
+                                  "collect, or idle. "
+                                  + self._whitelist_snippet(board, rejected))
                 history.append((reply, correction))
+                self.log.log("vision_drive", ok=False,
+                             reason="action_parse_fail",
+                             reply=(reply or "")[:120], attempt=attempt + 1,
+                             fixation=fixation >= 2)
+                # 3-strikes heuristic fallback for parse fixation: the model
+                # keeps emitting get_board_state as an action (the prefill
+                # primes it) even after targeted corrections. Instead of
+                # burning all 50 retries on the same mistake, fall back to
+                # the deterministic heuristic after 6 parse failures with
+                # fixation. This saves 40+ LLM calls per stuck step.
+                if len(history) >= 6 and fixation >= 2 and attempt >= 5:
+                    self.log.log("vision_drive", ok=False,
+                                 reason="heuristic_fallback_fixation",
+                                 attempts=attempt + 1)
+                    return self.fallback.next_move(board, self._frame)
                 continue
             key = (move.kind, move.cell_a, move.cell_b)
             if key in rejected:
@@ -1824,8 +2121,17 @@ class VisionDrivenPlanner(Planner):
                              action=move.kind, cell_a=move.cell_a, cell_b=move.cell_b)
                 correction = ("You already proposed this exact move and it was "
                               "rejected. Do NOT propose it again — pick a "
-                              "DIFFERENT pair of cells or a different action.")
+                              "DIFFERENT pair of cells or a different action. "
+                              "Valid options this step: " + self._whitelist_snippet(board, rejected))
                 history.append((reply, correction))
+                # 3-strikes for exact repeats: the model keeps re-sampling
+                # the same (kind, cells) even after being told not to. After
+                # 6 history entries, fall back to heuristic rather than loop.
+                if len(history) >= 6 and attempt >= 5:
+                    self.log.log("vision_drive", ok=False,
+                                 reason="heuristic_fallback_repeat",
+                                 attempts=attempt + 1, rejected=len(rejected))
+                    return self.fallback.next_move(board, self._frame)
                 continue
                 # don't accept `idle` immediately after a rejection. The
             # correction message already tells the model what was wrong; the
@@ -1865,9 +2171,11 @@ class VisionDrivenPlanner(Planner):
                 satiety_capacity=fb.satiety_capacity,
                 craved_item=fb.craved_item, craved_level=fb.craved_level,
                 craving_bonus=fb.craving_bonus_est,
+                craving_need=self._craving_need_remaining(),
                 prefer_item=fb.feed_prefer_item,
                 chain_map=self._chain_map(),
-                protect_family=self._strategy_family)
+                protect_family=self._strategy_family,
+                slime_count=getattr(fb, "slime_count", None))
             if reason is None:
                 # A successful move DOES NOT wipe the cross-step rejection
                 # memory. Previously we cleared the whole list here ("board
@@ -1893,9 +2201,11 @@ class VisionDrivenPlanner(Planner):
                         craved_item=fb.craved_item,
                         craved_level=fb.craved_level,
                         craving_bonus=fb.craving_bonus_est,
+                        craving_need=self._craving_need_remaining(),
                         prefer_item=fb.feed_prefer_item,
                         chain_map=self._chain_map(),
-                        protect_family=self._strategy_family) is None):
+                        protect_family=self._strategy_family,
+                        slime_count=getattr(fb, "slime_count", None)) is None):
                         # successful identify-then-validate path — leave the
                 # cross-step rejection memory intact (see the note on the
                 # plain-validate success above; the item-shift + TTL prune
@@ -1946,19 +2256,73 @@ class VisionDrivenPlanner(Planner):
             # summary-model learning containing "rejected"/"validate").
             self.log.log("rejection", reason=reason, action=move.kind,
                          cell_a=move.cell_a, cell_b=move.cell_b)
+            # 3-strikes for general validation loops: if the model has
+            # burned many retries without finding a valid move and the
+            # nudge has no better hint (or the rejected set is huge),
+            # fall back to heuristic rather than burning the remaining
+            # 40+ retries. The model demonstrably ignores generic
+            # corrections after ~5 failures (feed ×47, get_board_state ×50).
+            if len(history) >= 8 or len(rejected) >= 8:
+                if not nudge or len(rejected) >= 10:
+                    self.log.log("vision_drive", ok=False,
+                                 reason="heuristic_fallback_validation",
+                                 attempts=attempt + 1, rejected=len(rejected))
+                    return self.fallback.next_move(board, self._frame)
         raise ValueError(f"vision_drive: no valid move after {self.max_retries + 1} attempts")
 
     def _observe(self, messages: list[dict], board) -> None:
-        """Mandatory get_board_state round; appends tool call + result to messages."""
+        """Mandatory get_board_state round; appends tool call + result to messages.
+
+        Uses MINIMAL prompt messages (not the full conversation): probed
+        live, this model emits a perfect native tool call for a short
+        direct command, but burns its whole budget thinking (empty reply)
+        when the same required call follows the ~25k-char system prompt +
+        history. get_board_state takes no arguments, so no context is
+        needed at all — the result is appended to the real `messages`.
+
+        Heartbeat skip: the tool takes no arguments and the result text is
+        fully deterministic, so most steps inject the render directly with
+        no LLM round (~20-50s saved per step). A live call runs on heartbeat
+        steps to keep the native channel warm and catch renderer drift.
+        """
         if not self.tool_enabled:
+            return
+        if self._step_count % OBSERVE_HEARTBEAT_STEPS != 1:
+            try:
+                text = self._board_state_text(board)
+            except Exception as exc:
+                self.log.log("vision_drive", ok=False,
+                             reason="board_text_failed", error=str(exc))
+                return
+            tc = {"type": "function",
+                  "id": f"direct_{self._step_count}",
+                  "function": {"name": "get_board_state", "arguments": "{}"}}
+            messages.append(self._tool_call_msg(tc))
+            messages.append({"role": "tool", "tool_call_id": tc["id"],
+                             "content": text})
+            self.log.log("vision_drive", ok=True, reason="observe_heartbeat_skip")
             return
         # Retry once: the reasoning model can exhaust a small generation budget
         # on thinking and then emit JSON (or nothing) instead of the tool call.
+        # NOTE: the retry nudge is scoped to a TEMPORARY copy of messages.
+        # Appending "You must call get_board_state ..." to the shared list
+        # leaks it into every later answer round (_ask_once strips only
+        # tool-role messages), where it directly contradicts the answer
+        # instruction ("reply with ONLY a JSON action, NOT a tool call") and
+        # primes the {"action":"get_board_state"} fixation.
+        observe_msgs = [
+            {"role": "user", "content": (
+                "Call get_board_state now. Emit ONLY the tool call.")},
+        ]
         for attempt in range(2):
+            attempt_msgs = (observe_msgs if attempt == 0
+                            else observe_msgs + [{"role": "user", "content": (
+                                "You must call get_board_state now — reply with "
+                                "a tool call, not JSON text.")}])
             content, tool_calls, full_msg = self.client.chat_message(
-                _strip_images(messages), max_tokens=512, tools=[BOARD_TOOL],
+                attempt_msgs, max_tokens=256, tools=[BOARD_TOOL],
                 tool_choice="required")
-            self._log_chat(messages, content, tool_calls, full_msg)
+            self._log_chat(attempt_msgs, content, tool_calls, full_msg)
             if tool_calls:
                 break
             # Some models (e.g. Gemma GGUFs) reply to tool_choice="required"
@@ -1970,16 +2334,133 @@ class VisionDrivenPlanner(Planner):
                 tool_calls = [synth]
                 break
             self.log.log("vision_drive", ok=False, reason="no_tool_call", reply=content)
-            if attempt == 0:
-                messages.append({"role": "user", "content": (
-                    "You must call get_board_state first — reply with a tool call, "
-                    "not JSON text.")})
         else:
+            # Both tool rounds failed (model emitted JSON text or nothing
+            # instead of a tool call). Fall back to the DETERMINISTIC
+            # classifier render injected as a synthetic tool result — the
+            # board text, whitelist, and Best hints are code-owned and need
+            # no LLM. Without this the answer round decides from the
+            # screenshot alone: no whitelist arrives, and the model proposes
+            # blind moves (observed: spawn ×5 on non-graves, then a
+            # nudge-quoted max-level merge the game no-ops). _ask_once folds
+            # role=="tool" contents into "Tool results", so this flows
+            # through the exact same path as a real tool result.
+            try:
+                text = self._board_state_text(board)
+            except Exception as exc:
+                self.log.log("vision_drive", ok=False,
+                             reason="board_text_failed", error=str(exc))
+                return
+            self.log.log("vision_drive", ok=False,
+                         reason="no_tool_call_fallback_board_text")
+            messages.append({"role": "tool", "tool_call_id": "synth_board_state",
+                             "content": text})
             return
         for tc in tool_calls:
             messages.append(self._tool_call_msg(tc))
             messages.append({"role": "tool", "tool_call_id": tc["id"],
                              "content": self._exec_tool(tc, board)})
+
+    def _compel_buy(self, messages: list[dict], board, family: str,
+                    reason: str, affordable: bool = False,
+                    confirm: bool = False) -> None:
+        """Force a `buy_station(family, confirm=…)` dialog round.
+
+        Uses MINIMAL prompt messages naming the family explicitly: probed
+        live, this model emits a perfect native tool call for a short
+        direct command, but burns its budget thinking (empty reply) when
+        the same required call follows the full conversation. Appends the
+        tool call + result to `messages` like any other tool round.
+        `confirm=True` completes a staged pending buy; False only reads.
+        """
+        compel_msgs = [
+            {"role": "user", "content": (
+                f'Call buy_station with family "{display_family(family)}" '
+                f"and confirm={'true' if confirm else 'false'}. "
+                "Emit ONLY the tool call.")},
+        ]
+        content, tool_calls, full_msg = self.client.chat_message(
+            compel_msgs, max_tokens=1024, tools=[BUY_TOOL_SHORT],
+            tool_choice="required")
+        self._log_chat(compel_msgs, content, tool_calls, full_msg)
+        self.log.log("vision_drive", ok=True, reason=reason,
+                     family=family, affordable=affordable)
+        fired = False
+        if tool_calls:
+            fired = True
+            for tc in tool_calls:
+                messages.append(self._tool_call_msg(tc))
+                messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                 "content": self._exec_tool(tc, board)})
+        else:
+            synth = _synthesize_buy_call(content, family=family)
+            if synth is not None:
+                # Pin confirm to the compelled value: the text default is
+                # True, which would COMPLETE a purchase the compel only
+                # meant to read. Parse first, then override when the text
+                # didn't explicitly say confirm=true.
+                try:
+                    sargs = json.loads(synth["function"]["arguments"])
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    sargs = {}
+                if confirm or "confirm" not in (sargs or {}):
+                    sargs["confirm"] = confirm
+                    synth["function"]["arguments"] = json.dumps(sargs)
+                fired = True
+                self.log.log("vision_drive", ok=True, reason="synth_buy_compel")
+                messages.append(self._tool_call_msg(synth))
+                messages.append({"role": "tool", "tool_call_id": synth["id"],
+                                 "content": self._exec_tool(synth, board)})
+        # No-effect backoff: this thinking model sometimes emits empty text
+        # for required calls (probed: compounds like "supplycupboard" derail
+        # it while "grave" lands). A compel that fires every step with no
+        # resulting buy burns a full LLM round each time — after 3
+        # consecutive no-effect compels, stand down until something changes
+        # (a successful buy resets the count).
+        if fired:
+            self._compel_misfires.pop(family, None)
+        else:
+            self._compel_misfires[family] = self._compel_misfires.get(family, 0) + 1
+            if self._compel_misfires[family] >= 3:
+                self.log.log("vision_drive", ok=False,
+                             reason="compel_backoff", family=family)
+
+    def _compel_cravings_read(self, messages: list[dict], board,
+                                bubble: str) -> None:
+        """Force a `get_cravings` menu-read round.
+
+        Same minimal-prompt required-call pattern as `_compel_buy`: the
+        model reliably emits the tool call for a short direct command.
+        Unlike buy there is no text synth fallback — a text reply can't
+        replace a menu cycle — so a no-call round only logs a misfire
+        (3 strikes stand down, same key family as the buy backoff).
+        Firing appends the call + result to `messages`, so the menu's
+        level/count land in context and `_track_cravings` caches them via
+        the normal `_exec_tool` path.
+        """
+        compel_msgs = [
+            {"role": "user", "content": (
+                "Call get_cravings to read the current Devourer craving "
+                "(item, level, progress, reward). Emit ONLY the tool call.")},
+        ]
+        content, tool_calls, full_msg = self.client.chat_message(
+            compel_msgs, max_tokens=1024, tools=[CRAVINGS_TOOL],
+            tool_choice="required")
+        self._log_chat(compel_msgs, content, tool_calls, full_msg)
+        self.log.log("vision_drive", ok=True,
+                     reason="compelled_cravings_read", bubble=bubble)
+        if tool_calls:
+            for tc in tool_calls:
+                messages.append(self._tool_call_msg(tc))
+                messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                 "content": self._exec_tool(tc, board)})
+            self._compel_misfires.pop("cravings", None)
+        else:
+            self._compel_misfires["cravings"] = \
+                self._compel_misfires.get("cravings", 0) + 1
+            if self._compel_misfires["cravings"] >= 3:
+                self.log.log("vision_drive", ok=False,
+                             reason="compel_backoff", family="cravings")
 
     def _optional_tools(self, messages: list[dict], board) -> tuple[str, Move] | None:
         """ONE consolidated optional-tool round for the whole step.
@@ -2036,26 +2517,10 @@ class VisionDrivenPlanner(Planner):
         # without this proxy, so the compelled gate was never firing.
         if (self.shop is not None and self.shop._pending_buy
                 and self.live and self.tool_enabled):
-            content, tool_calls, full_msg = self.client.chat_message(
-                _strip_images(messages), max_tokens=256, tools=[BUY_TOOL],
-                tool_choice="required")
-            self._log_chat(messages, content, tool_calls, full_msg)
-            if tool_calls:
-                for tc in tool_calls:
-                    messages.append(self._tool_call_msg(tc))
-                    messages.append({"role": "tool", "tool_call_id": tc["id"],
-                                     "content": self._exec_tool(tc, board)})
-            else:
-                # Some small models reply to tool_choice="required" with the
-                # tool as plain JSON text — synthesize the call so the
-                # confirm still lands.
-                synth = _synthesize_buy_call(
-                    content, family=self.shop._pending_buy.get("family"))
-                if synth is not None:
-                    self.log.log("vision_drive", ok=True, reason="synth_buy_call")
-                    messages.append(self._tool_call_msg(synth))
-                    messages.append({"role": "tool", "tool_call_id": synth["id"],
-                                     "content": self._exec_tool(synth, board)})
+            self._compel_buy(messages, board,
+                             self.shop._pending_buy.get("family"),
+                             reason="compelled_buy_followthrough",
+                             confirm=True)
                                      # buy_station compel. The model has a station-build strategy
         # committed but never calls `buy_station(confirm=false)` on its own
         # — observed in 4 consecutive live sessions: the strategy note
@@ -2086,29 +2551,90 @@ class VisionDrivenPlanner(Planner):
                 and self._strategy_fresh()
                 and self._strategy
                 and self._strategy.get("kind") == "station"
+                and self._compel_misfires.get(self._strategy.get("noun"), 0) < 3
                 and (self._strategy_affordable()
                      or not (self.shop.cost_cache or {}).get(
                          self._strategy.get("noun")))):
-            content, tool_calls, full_msg = self.client.chat_message(
-                _strip_images(messages), max_tokens=256, tools=[BUY_TOOL],
-                tool_choice="required")
-            self._log_chat(messages, content, tool_calls, full_msg)
-            self.log.log("vision_drive", ok=True, reason="compelled_buy_stage",
-                         family=self._strategy.get("noun"),
-                         affordable=self._strategy_affordable())
-            if tool_calls:
-                for tc in tool_calls:
-                    messages.append(self._tool_call_msg(tc))
-                    messages.append({"role": "tool", "tool_call_id": tc["id"],
-                                     "content": self._exec_tool(tc, board)})
-            else:
-                synth = _synthesize_buy_call(
-                    content, family=self._strategy.get("noun"))
-                if synth is not None:
-                    self.log.log("vision_drive", ok=True, reason="synth_buy_compel")
-                    messages.append(self._tool_call_msg(synth))
-                    messages.append({"role": "tool", "tool_call_id": synth["id"],
-                                     "content": self._exec_tool(synth, board)})
+            self._compel_buy(messages, board, self._strategy.get("noun"),
+                             reason="compelled_buy_stage",
+                             affordable=self._strategy_affordable())
+        # Craving-producer buy compel. When the craving cannot be satisfied
+        # from the board (no item, no producer station — see
+        # `_craving_station_need`), the model will never buy the station on
+        # its own: nothing connects the craving to the Station panel. Force
+        # the same `buy_station(confirm=false)` dialog-read the strategy
+        # compel forces, so cost/currency populate and the post-loop
+        # compelled-confirm can complete the purchase. Skipped when the
+        # strategy compel already staged a buy (single pending slot), when a
+        # conflicting station strategy is active (the buy guard would refuse
+        # with strategy_mismatch), and under the same affordable-or-unknown
+        # gate so an unaffordable known cost doesn't reopen the panel.
+        craving_fam = self._craving_station_need(board)
+        # Throttle: a previous full scan that missed the family (locked /
+        # unreleased station) suppresses re-scans for CARD_RESCAN_SECONDS —
+        # otherwise every step reopens the panel and re-swipes the sheet.
+        # Stronger gate first: a no-card miss recorded at the CURRENT feats
+        # tier while locked slots exist means the station is unlock-gated
+        # (observed: supply cupboard behind "Tier 5 Feats Requires") —
+        # rescanning before the tier moves cannot succeed, so skip outright.
+        craving_scan_due = True
+        if craving_fam and self.shop is not None:
+            try:
+                from vision.panels import CARD_RESCAN_SECONDS
+                last_miss = (self.shop._card_missing or {}).get(craving_fam, 0)
+                craving_scan_due = (time.time() - last_miss) >= CARD_RESCAN_SECONDS
+                last = self._last_currency_result or {}
+                # Locked stand-down ONLY on fresh absence evidence: the
+                # family must still be missing from the latest scan
+                # (_card_missing set by a full scan, cleared on any find).
+                # A stale miss record alone must never suppress a buy —
+                # the sheet may have changed since (observed: cupboard
+                # present but an old miss + unchanged tier stood the
+                # compel down).
+                if (craving_fam in (self.shop._card_missing or {})
+                        and isinstance(last, dict)
+                        and last.get("family") == craving_fam
+                        and (last.get("error") or "").startswith("no ")
+                        and last.get("locked")
+                        and last.get("_tier_at_miss") is not None
+                        and last.get("_tier_at_miss") == (self._feats_cache or {}).get("tier")):
+                    craving_scan_due = False
+                    self.log.log("vision_drive", ok=False,
+                                 reason="craving_buy_locked",
+                                 family=craving_fam,
+                                 requires=last.get("locked"))
+            except Exception:
+                craving_scan_due = True
+        if (craving_fam and craving_scan_due and self.live and self.tool_enabled
+                and self.shop is not None
+                and self.shop._pending_buy is None
+                and self._compel_misfires.get(craving_fam, 0) < 3
+                and not (self._strategy_family and self._strategy_family != craving_fam)
+                and (self._family_affordable(craving_fam)
+                     or not (self.shop.cost_cache or {}).get(craving_fam))):
+            self._compel_buy(messages, board, craving_fam,
+                             reason="compelled_craving_buy_stage",
+                             affordable=self._family_affordable(craving_fam))
+        # Compelled cravings read (Sep 7). The merge guard below can only
+        # protect the craved level once the menu's level/count are known,
+        # but the model never takes the optional get_cravings tool on its
+        # own (observed: zero calls in a full run that then merged two
+        # eyemonster_lvl1 into a lvl2 for a lvl1 craving). Force one
+        # minimal required read when the bubble shows a craving the cache
+        # doesn't know (never read, or switched since the last read) —
+        # same forced-call pattern as the buy compels, same 3-strike
+        # backoff. A successful read populates the cache via _exec_tool,
+        # so this fires at most once per craving.
+        try:
+            _bubble = self._bubble_craving_item()
+            _cache_item = (self._craving_cache or {}).get("item")
+            if (_bubble and self.live and self.tool_enabled
+                    and self.cravings is not None
+                    and _cache_item != _bubble
+                    and self._compel_misfires.get("cravings", 0) < 3):
+                self._compel_cravings_read(messages, board, _bubble)
+        except Exception:
+            pass
         budgets = {"get_cravings": MAX_CRAVINGS,
                    "tap_button": MAX_PANELS,
                    "get_champions": MAX_CHAMPIONS,
@@ -2116,7 +2642,8 @@ class VisionDrivenPlanner(Planner):
                    "lookup_wiki": MAX_WIKI,
                    "set_strategy": MAX_STRATEGY,
                    "buy_station": MAX_BUYS,
-                   "collect_queue": MAX_QUEUE}
+                   "collect_queue": MAX_QUEUE,
+                   "collect_feat_rewards": MAX_FEAT_COLLECT}
         tool_specs = {
             "get_cravings": CRAVINGS_TOOL,
             "tap_button": PANEL_TOOL,
@@ -2126,6 +2653,7 @@ class VisionDrivenPlanner(Planner):
             "set_strategy": STRATEGY_TOOL,
             "buy_station": BUY_TOOL,
             "collect_queue": QUEUE_TOOL,
+            "collect_feat_rewards": FEAT_COLLECT_TOOL,
         }
         # track the pending buy as we entered the optional-tools
         # loop, so the post-loop compelled-confirm knows whether a NEW buy
@@ -2167,14 +2695,34 @@ class VisionDrivenPlanner(Planner):
                 elif name == "collect_queue":
                     if self.queue_box is None:
                         continue
+                elif name == "collect_feat_rewards":
+                    if self.panels is None:
+                        continue
+                    # Offer even when the read cache is fresh — the point is
+                    # to let the model force an immediate collect when it
+                    # believes a feat just completed, without waiting for the
+                    # 15-step periodic read. Gate only on live/tool_enabled.
+                    if not self.live or not self.tool_enabled:
+                        continue
                 tools.append(tool_specs[name])
             if not tools:
                 return None
             self.log.log("optional_tools", names=[t["function"]["name"] for t in tools])
+            # Batching nudge (scoped copy — never leaks into answer rounds):
+            # one LLM round per tool is the worst case today; the loop below
+            # already executes every returned call, so asking for all
+            # independent calls up front collapses N rounds into one.
+            round_msgs = messages
+            if len(tools) > 1:
+                round_msgs = messages + [
+                    {"role": "user", "content": (
+                        "If you need several of these, call them ALL in this "
+                        "round (multiple tool calls at once) instead of one "
+                        "per round.")}]
             content, tool_calls, full_msg = self.client.chat_message(
-                _strip_images(messages), max_tokens=512, tools=tools,
+                _strip_images(round_msgs), max_tokens=512, tools=tools,
                 tool_choice="auto")
-            self._log_chat(messages, content, tool_calls, full_msg)
+            self._log_chat(round_msgs, content, tool_calls, full_msg)
             if not tool_calls:
                 # No tool called — either the model skipped optional tools or
                 # it answered with a text action JSON. Return the parsed move
@@ -2183,6 +2731,27 @@ class VisionDrivenPlanner(Planner):
                 move = self._parse_action(content)
                 if move is not None:
                     return content, move
+                # Text-JSON buy attempt: this model often answers required/
+                # voluntary tool prompts with plain JSON text instead of a
+                # native call (probed: compounds derail native generation).
+                # Honor an explicit buy_station text call within the buy
+                # budget rather than dropping the round.
+                if self.shop is not None and budgets.get("buy_station", 0) > 0:
+                    synth = _synthesize_buy_call(content, family="")
+                    if synth is not None:
+                        try:
+                            fam = json.loads(synth["function"]["arguments"]).get("family")
+                        except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
+                            fam = None
+                        if fam:
+                            self.log.log("vision_drive", ok=True,
+                                         reason="synth_buy_optional")
+                            budgets["buy_station"] -= 1
+                            messages.append(self._tool_call_msg(synth))
+                            messages.append({"role": "tool",
+                                             "tool_call_id": synth["id"],
+                                             "content": self._exec_tool(synth, board)})
+                            continue
                 return None
             for tc in tool_calls:
                 nm = tc.get("function", {}).get("name")
@@ -2208,23 +2777,9 @@ class VisionDrivenPlanner(Planner):
         if (pending_after is not None
                 and pending_before is None
                 and self.live and self.tool_enabled):
-            content, tool_calls, full_msg = self.client.chat_message(
-                _strip_images(messages), max_tokens=256, tools=[BUY_TOOL],
-                tool_choice="required")
-            self._log_chat(messages, content, tool_calls, full_msg)
-            if tool_calls:
-                for tc in tool_calls:
-                    messages.append(self._tool_call_msg(tc))
-                    messages.append({"role": "tool", "tool_call_id": tc["id"],
-                                     "content": self._exec_tool(tc, board)})
-            else:
-                synth = _synthesize_buy_call(
-                    content, family=pending_after.get("family"))
-                if synth is not None:
-                    self.log.log("vision_drive", ok=True, reason="synth_buy_call_post")
-                    messages.append(self._tool_call_msg(synth))
-                    messages.append({"role": "tool", "tool_call_id": synth["id"],
-                                     "content": self._exec_tool(synth, board)})
+            self._compel_buy(messages, board, pending_after.get("family"),
+                             reason="compelled_buy_post_loop",
+                             confirm=True)
         return None
 
     def _craving_cache_fresh(self) -> bool:
@@ -2241,6 +2796,104 @@ class VisionDrivenPlanner(Planner):
         return bool(cache is not None and cache.get("item") == self._last_craving
                     and cache.get("level") == self._last_craving_level
                     and self._step_count - cache.get("step", 0) < CRAVINGS_REFRESH_STEPS)
+
+    def _craving_need_remaining(self) -> int | None:
+        """Remaining craving count (required - done) from the last menu read.
+
+        None when no menu read has landed (level/count unknown — the merge
+        guard must not fire on bubble-only knowledge) or the counts are
+        unparseable. Zero means complete-but-stale (guard allows merges)."""
+        cache = self._craving_cache
+        if not cache:
+            return None
+        try:
+            req = int(cache.get("count_required"))
+            done = int(cache.get("count_done") or 0)
+        except (TypeError, ValueError):
+            return None
+        if req <= 0:
+            return None
+        return max(0, req - done)
+
+    def note_identified(self, pos, item_id: str | None) -> None:
+        """Record a popup-resolved cell label for persistence.
+
+        Called for every successful popup identify (proactive UNID reads,
+        noop re-reads). The label is ground truth until the cell genuinely
+        changes — see `apply_label_memory`. Stamped with the planner's own
+        step counter; bounded to 64 entries (oldest evicted).
+        """
+        if not item_id or not pos:
+            return
+        try:
+            key = (int(pos[0]), int(pos[1]))
+        except (TypeError, ValueError, IndexError):
+            return
+        self._label_memory[key] = (item_id, self._step_count)
+        if len(self._label_memory) > 64:
+            oldest = min(self._label_memory,
+                         key=lambda k: self._label_memory[k][1])
+            del self._label_memory[oldest]
+
+    def apply_label_memory(self, board, prev_move=None) -> int:
+        """Re-apply popup-resolved labels over template flip-flop. Returns count applied.
+
+        Motivation (Sep 7): eyeball vs eyemonster_lvl1 are
+        template-indistinguishable (cross-bank matches ~1.0 both ways), so a
+        popup-resolved lvl1 flips back to eyeball next classify and the
+        craving guard/feed never see it — and no bank growth can fix
+        identical sprites. The popup is ground truth: re-apply the recorded
+        label when the template disagrees *inside the ambiguous pair* (or
+        reads UNID). Score/margin stay the template's (honest match
+        quality); only the id is overridden.
+        Safety: entries expire after LABEL_MEMORY_TTL steps; cells touched
+        by our last move, emptied cells, and cells whose template label
+        left the pair (genuine change — e.g. a champion arriving) drop the
+        entry instead of overriding. Never raises (all failures return 0).
+        """
+        try:
+            touched = set()
+            if prev_move is not None:
+                for c in (prev_move.cell_a, prev_move.cell_b,
+                          getattr(prev_move, "target", None)):
+                    if c:
+                        try:
+                            touched.add((int(c[0]), int(c[1])))
+                        except (TypeError, ValueError, IndexError):
+                            pass
+            applied = 0
+            for cell in board.cells:
+                key = (cell.row, cell.col)
+                mem = self._label_memory.get(key)
+                if mem is None:
+                    continue
+                item_id, at_step = mem
+                if self._step_count - at_step > LABEL_MEMORY_TTL:
+                    del self._label_memory[key]
+                    continue
+                if key in touched or not cell.occupied:
+                    if key in self._label_memory:
+                        del self._label_memory[key]
+                    continue
+                if cell.item_id == item_id:
+                    continue
+                if (cell.item_id is not None
+                        and (cell.item_id not in LABEL_MEMORY_PAIR
+                             or item_id not in LABEL_MEMORY_PAIR)):
+                    del self._label_memory[key]
+                    continue
+                was = cell.item_id
+                cell.item_id = item_id
+                applied += 1
+                try:
+                    self.log.log("label_memory_applied",
+                                 cell=[cell.row, cell.col],
+                                 was=was, now=item_id)
+                except Exception:
+                    pass
+            return applied
+        except Exception:
+            return 0
 
     def _feats_cache_fresh(self) -> bool:
         """True when the cached feats-panel read is fresh enough that the model
@@ -2275,28 +2928,14 @@ class VisionDrivenPlanner(Planner):
             return False
         return True
 
-    def _strategy_affordable(self) -> bool:
-        """True when the active station-build strategy is affordable
-        under the cached Rune balance.
-
-        The buy_station compel calls `buy_station(confirm=false)` ONLY when
-        the cached currency can cover the cost — otherwise we'd be opening
-        the Station panel every step just to read "unaffordable: needs
-        20 ice; have 5 ice" and BACK out. The cost comes from
-        `self.shop.cost_cache[family]` (populated by the most recent
-        Station-panel read); the balance comes from
-        `self._currency` (also cached from the most recent Station-panel
-        read — the lair's HUD overlaps the slots and reads wrong, so the
-        only safe source is the open-panel read). If either is missing,
-        the strategy is NOT affordable yet (we don't know the cost, so
-        the call would be a guess)."""
-        if self.shop is None:
+    def _family_affordable(self, family: str) -> bool:
+        """True when `family`'s station is affordable under the cached Rune
+        balance. Cost from `shop.cost_cache`, balance from `_currency` (both
+        populated by the most recent Station-panel read). Missing cost or
+        balance -> False (the call would be a guess)."""
+        if self.shop is None or not family:
             return False
-        s = self._strategy or {}
-        noun = s.get("noun")
-        if not noun:
-            return False
-        cost = (self.shop.cost_cache or {}).get(noun)
+        cost = (self.shop.cost_cache or {}).get(family)
         if not cost:
             return False
         currency = self._currency or {}
@@ -2307,6 +2946,46 @@ class VisionDrivenPlanner(Planner):
                 if currency.get(rune, 0) < need:
                     return False
         return True
+
+    def _strategy_affordable(self) -> bool:
+        """True when the active station-build strategy is affordable
+        under the cached Rune balance.
+
+        The buy_station compel calls `buy_station(confirm=false)` ONLY when
+        the cached currency can cover the cost — otherwise we'd be opening
+        the Station panel every step just to read "unaffordable: needs
+        20 ice; have 5 ice" and BACK out. See `_family_affordable`."""
+        if self.shop is None:
+            return False
+        s = self._strategy or {}
+        noun = s.get("noun")
+        if not noun:
+            return False
+        return self._family_affordable(noun)
+
+    def _want_buy_this_step(self, board) -> bool:
+        """True when a buy_station panel visit is likely this step (pure
+        cache reads, no device). Mirrors the three buy gates (pending
+        follow-through, station-strategy compel, craving compel) minus
+        their misfire/scan throttles — used to defer scheduled FEATS
+        reads so a buy step costs one panel cycle, not two. Slight
+        over-prediction (gate throttles later) only costs a deferred
+        feats read, which TTLs tolerate.
+        """
+        try:
+            if self.shop is None:
+                return False
+            if self.shop._pending_buy is not None:
+                return True
+            if (self._strategy_fresh() and self._strategy
+                    and self._strategy.get("kind") == "station"
+                    and self._strategy.get("noun")):
+                return True
+            if self._craving_station_need(board):
+                return True
+        except Exception:
+            pass
+        return False
 
     def _popup_next(self, board) -> tuple[int, int, str] | None:
         """Find a known item whose popup-body recipe isn't banked yet.
@@ -2496,37 +3175,192 @@ class VisionDrivenPlanner(Planner):
         except Exception:
             return
 
+    # Independent popup reads agreeing on one id for one cell, after which
+    # the id banks despite OCR disagreement (see identify_unbanked).
+    UNBANKED_CONSENSUS = 3
+    UNBANKED_VOTE_CELLS = 30
+
+    def _unbanked_consensus(self, cell, item_id: str) -> bool:
+        """Record one vote for (cell, item_id); True once consensus reached.
+
+        Votes are keyed per cell and reset for other ids on the same cell
+        (a changing popup story is not consensus). Bounded to
+        UNBANKED_VOTE_CELLS cells (oldest evicted) so dead cells can't
+        accumulate forever.
+        """
+        try:
+            votes = getattr(self, "_unbanked_votes", None)
+            if votes is None:
+                votes = {}
+                self._unbanked_votes = votes
+            key = (cell.row, cell.col)
+            cell_votes = votes.get(key)
+            if cell_votes is None or cell_votes.get("__id__") != item_id:
+                cell_votes = {"__id__": item_id, item_id: 0}
+                votes[key] = cell_votes
+            cell_votes[item_id] = cell_votes.get(item_id, 0) + 1
+            while len(votes) > self.UNBANKED_VOTE_CELLS:
+                votes.pop(next(iter(votes)))
+            if cell_votes[item_id] >= self.UNBANKED_CONSENSUS:
+                votes.pop(key, None)
+                self.log.log("identify_consensus_banked",
+                             cell=[cell.row, cell.col], item=item_id,
+                             votes=self.UNBANKED_CONSENSUS)
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _auto_collect_queue(self, board, frame) -> None:
+        """Place a queued dock reward before planning (code-driven).
+
+        The model never emits native tool calls on this stack, so the
+        collect_queue tool can never fire voluntarily. When has_reward is
+        true AND the board has room (same congestion gate collect() itself
+        enforces), place immediately — queued rewards are chests/rune piles
+        the bot wants on the board anyway. The placed cell is patched so
+        this step plans on the post-placement board; next step's classify
+        re-reads it properly. All outcomes are logged; failures never
+        stall the step.
+        """
+        if (not self.live or not self.tool_enabled
+                or self.queue_box is None or frame is None):
+            return
+        try:
+            from vision.queue_box import has_reward
+            from planner.agent import CONGESTION_THRESHOLD
+            if not has_reward(frame):
+                return
+            empty = sum(1 for c in board.cells if not c.occupied)
+            if empty <= CONGESTION_THRESHOLD:
+                # Visible skip (not silent): a queued reward rotting on a
+                # full board otherwise looks identical to a broken collect
+                # path in the logs. Throttled: only on transition into the
+                # blocked state (tracked per reward-present episode).
+                if not getattr(self, "_queue_blocked_logged", False):
+                    self.log.log("queue_collect_skipped", via="auto",
+                                 reason="congested", empty=empty)
+                    self._queue_blocked_logged = True
+                return
+            self._queue_blocked_logged = False
+            res = self.queue_box.collect()
+        except Exception as exc:
+            self.log.log("queue_collect_miss", via="auto", error=str(exc))
+            return
+        if not res.get("placed"):
+            self.log.log("queue_collect_miss", via="auto",
+                         error=res.get("error"))
+            return
+        self.log.log("queue_collected", placed=True, via="auto",
+                     opened=bool(res.get("opened")),
+                     item=res.get("placed_item"), cell=res.get("cell"),
+                     error=res.get("error"))
+        try:
+            cell_rc = res.get("cell")
+            if cell_rc:
+                target = board.cell_at(int(cell_rc[0]), int(cell_rc[1]))
+                if target is not None:
+                    target.occupied = True
+                    placed = res.get("placed_item")
+                    if (placed and placed not in ("unidentified", "unknown")
+                            and self.classifier is not None
+                            and self.classifier.has(placed)):
+                        target.item_id = placed
+                        target.score = 1.0
+                        target.margin = 1.0
+                    else:
+                        target.item_id = None
+                        target.score = 0.0
+                        target.margin = 0.0
+        except Exception:
+            pass
+
     def _observe_feats(self) -> None:
         """Periodically open the FEATS panel, collect any ready rewards, read
         it, and cache the result.
 
         Live only; requires a PanelReader. The open->(collect)->read->BACK
-        cycle is as intrusive as get_cravings so it's gated by
+        cycle is as intrusive as get_cravings so the full read is gated by
         FEATS_REFRESH_STEPS and MAX_PANELS per refresh; the cached tier+feats
         are shown in `get_board_state`, so the model sees its current missions
         and can steer moves toward one that's close to completion.
 
-        Collecting is the point of opening the panel in the first place: a
-        completed feat's reward is only banked when its Collect button is
-        tapped (previously the bot read status but never claimed the reward).
-        Uses `panels.collect_feat_rewards` (template-matched, verified,
-        bounded); `feat_reward_collected` is logged with the count.
+        Collecting is decoupled from reading: even when the read cache is
+        fresh, an opportunistic collect is attempted every FEAT_COLLECT_STEPS
+        if the cached feats indicate a done reward sitting unclaimed (the
+        periodic 15-step read alone left rewards sitting for up to 14 steps
+        after completion — observed in the 100-step soak with 0 collects).
+        The `collect_feat_rewards` tool also lets the model force an immediate
+        collect without waiting for either timer. Uses
+        `panels.collect_feat_rewards` (template-matched, verified, bounded);
+        `feat_reward_collected` is logged with the count.
         """
         if not self.live or self.panels is None or not self.tool_enabled \
                 or self._frame is None:
             return
+        if self._defer_panel_reads:
+            # A buy will open the Station panel this step — skip the
+            # scheduled FEATS cycle so the step costs one panel visit, not
+            # two. The buy's own visit still collects nothing feat-side;
+            # the normal schedule resumes next step.
+            self.log.log("feats_panel_deferred", reason="buy_this_step")
+            return
         cache = self._feats_cache
         if cache is not None and self._step_count - cache.get("step", 0) < FEATS_REFRESH_STEPS:
+            # Read cache is fresh — still opportunistically collect if a
+            # cached feat is done and we haven't tried recently. This keeps
+            # the read at 15 steps but collects at 5. Skip when the last
+            # attempt found nothing AND the cache hasn't refreshed since
+            # (reopening the panel every 5 steps for a permanently
+            # unclaimable button wastes ~10-20s a time).
+            has_done = any(bool(f.get("done")) for f in (cache.get("feats") or []))
+            cache_newer = cache.get("step", 0) > self._last_feat_collect_step
+            if (has_done
+                    and self._step_count - self._last_feat_collect_step >= FEAT_COLLECT_STEPS
+                    and (self._last_feat_collect_found or cache_newer)):
+                try:
+                    result = self.panels.collect_feat_rewards(self._frame)
+                except Exception as exc:
+                    self.log.log("feats_read", ok=False, error=str(exc))
+                    return
+                self._last_feat_collect_step = self._step_count
+                panel = result.get("panel") or {}
+                feats = panel.get("feats") or []
+                collected = int(result.get("collected") or 0)
+                self._last_feat_collect_found = collected > 0 or bool(result.get("tier"))
+                if result.get("error"):
+                    self.log.log("feat_collect_miss", via="opportunistic",
+                                 error=result.get("error"),
+                                 claim_miss=result.get("claim_miss"))
+                    return
+                if feats:
+                    self._feats_cache = {"tier": panel.get("tier"), "feats": feats,
+                                         "step": self._step_count}
+                    self.log.log("feats_read", tier=panel.get("tier"), feats=len(feats))
+                if collected:
+                    self.log.log("feat_reward_collected", count=collected, via="opportunistic")
+                elif result.get("claim_miss"):
+                    # Buttons exist but none mapped to a done feat — visible
+                    # for calibration instead of a silent no-op.
+                    self.log.log("feat_collect_miss", via="opportunistic",
+                                 claim_miss=result.get("claim_miss"))
+                if result.get("tier"):
+                    self.log.log("tier_reward_collected", tier=panel.get("tier"), via="opportunistic")
             return
         try:
             result = self.panels.collect_feat_rewards(self._frame)
         except Exception as exc:
             self.log.log("feats_read", ok=False, error=str(exc))
             return
+        self._last_feat_collect_step = self._step_count
         panel = result.get("panel") or {}
         feats = panel.get("feats") or []
         collected = int(result.get("collected") or 0)
+        self._last_feat_collect_found = collected > 0 or bool(result.get("tier"))
         if result.get("error"):
+            self.log.log("feat_collect_miss", via="periodic",
+                         error=result.get("error"),
+                         claim_miss=result.get("claim_miss"))
             return
         if not feats:
             return
@@ -2535,6 +3369,9 @@ class VisionDrivenPlanner(Planner):
         self.log.log("feats_read", tier=panel.get("tier"), feats=len(feats))
         if collected:
             self.log.log("feat_reward_collected", count=collected)
+        elif result.get("claim_miss"):
+            self.log.log("feat_collect_miss", via="periodic",
+                         claim_miss=result.get("claim_miss"))
         if result.get("tier"):
             self.log.log("tier_reward_collected", tier=panel.get("tier"))
 
@@ -2599,10 +3436,11 @@ class VisionDrivenPlanner(Planner):
         # station-purchase / creature-collect / other (action-count etc).
         note = "committed — the priority layer now serves this objective"
         if kind == "station" and noun:
-            note += (f" — this feat needs the {noun} STATION "
+            disp = display_family(noun)
+            note += (f" — this feat needs the {disp} STATION "
                      f"from the Station panel: call buy_station(\""
-                     f"{noun}\", confirm=false) to check "
-                     f"affordability, then buy_station(\"{noun}"
+                     f"{disp}\", confirm=false) to check "
+                     f"affordability, then buy_station(\"{disp}"
                      f"\", confirm=true) to complete. Gather the runes first.")
         elif kind == "creature" and noun:
             note += (f" — progress by merging/collecting {noun} on the board")
@@ -2614,7 +3452,7 @@ class VisionDrivenPlanner(Planner):
                             "kind": kind, "noun": noun,
                             "note": note})
 
-    def _currency_line_text(self) -> str:
+    def _currency_line_text(self, need_family=None) -> str:
         """Rune balances and a station-build affordance reminder.
 
         The Rune bar is only visible when the Station menu is open (the
@@ -2629,6 +3467,11 @@ class VisionDrivenPlanner(Planner):
         and re-asks buy_station in a tight loop. The line also renders a
         "needs N more ice for grave" reminder when a station-build strategy
         is active and the cached balance says the user is short.
+
+        need_family lets the board state pass a non-strategy need (the
+        craving's producer station): same shortfall math applies. The
+        shortfall also names the feed-equivalent (≈N max-stack feeds) —
+        the model can't divide, so code does it.
         """
         if not self._last_currency_result:
             return ""
@@ -2649,7 +3492,8 @@ class VisionDrivenPlanner(Planner):
         # the unaffordable result but the next step's board state had
         # no Rune balance, so the model forgot and re-asked. This line
         # closes that loop.
-        if self._strategy_family:
+        if self._strategy_family or need_family:
+            family = self._strategy_family or need_family
             err = self._last_currency_result.get("error") or ""
             if "unaffordable" in err:
                 # Parse the cost from the error message
@@ -2675,9 +3519,26 @@ class VisionDrivenPlanner(Planner):
                             recipe = (f"Open chests (mana-free), merge {need_rune} "
                                       f"stacks, feed max-level for {need_rune} Runes.")
                         line += (f" You're {short} {need_rune} short for "
-                                  f"{self._strategy_family} (need {need_n}, "
-                                  f"have {have}). {recipe}")
+                                  f"{family} (need {need_n}, "
+                                  f"have {have}){self._feeds_equiv(need_rune, short)}. {recipe}")
         return line
+
+    def _feeds_equiv(self, rune: str, short: int) -> str:
+        """' (≈N max <stack> feeds)' for a rune shortfall, '' when unknown.
+
+        The model cannot divide a deficit into feeds; code does it from the
+        max-level stack's feed value (e.g. short 18 poison at 12/feed ≈
+        2 max poisonrune_lvl3 feeds).
+        """
+        try:
+            stack = f"{rune}rune_lvl3"
+            fv = (self._feed_values() or {}).get(stack)
+            if fv and fv > 0 and short > 0:
+                import math
+                return f" (≈{math.ceil(short / fv)} max {stack} feeds)"
+        except Exception:
+            pass
+        return ""
 
     
 
@@ -2717,9 +3578,7 @@ class VisionDrivenPlanner(Planner):
                 parts.append(f"[{o.kind}] {name} ({f.get('count_done', 0)}/{f.get('count_required', 0)}) [level]")
             else:
                 parts.append(f"[{o.kind}] {name} ({f.get('count_done', 0)}/{f.get('count_required', 0)}) [other]")
-        if done_parts:
-            parts.extend(done_parts)
-        if parts:
+        if parts or done_parts:
             return "Feats (tier " + str(cache.get("tier", 0)) + "): " + "; ".join(parts + done_parts) + "."
         return "Feats (tier " + str(cache.get("tier", 0)) + "): (none)"
 
@@ -2770,6 +3629,47 @@ class VisionDrivenPlanner(Planner):
                           f"({pb_age} step{'s' if pb_age != 1 else ''} old) "
                           f"— call buy_station('{pb_fam}', confirm=true) to complete")
             return line
+
+    def _suggested_direction(self, board) -> str:
+        """One-line meta-goal hint when no strategy is committed.
+
+        Replaces the retired StrategyPlanner's periodic LLM call: the same
+        META_GOALS thresholds evaluate code-side over cached state (no taps,
+        no LLM), and the winning goal renders here so the compelled
+        set_strategy round (and the model generally) chooses with direction.
+        Empty when a strategy is fresh (a direction is already committed) or
+        when no threshold fires.
+        """
+        if self._strategy_fresh():
+            return ""
+        try:
+            occupied = sum(1 for c in board.cells if c.occupied)
+            total = len(board.cells) or 1
+            fb = self.fallback
+            state = {
+                "champion": self._last_champion,
+                "satiety_remaining": getattr(fb, "satiety_remaining", None),
+                "satiety_capacity": getattr(fb, "satiety_capacity", None),
+                "board_congestion": occupied / total,
+                "slime_count": getattr(fb, "slime_count", None),
+                "mana_pct": (self._mana_fraction * 100
+                             if self._mana_fraction is not None else None),
+                "runes": self._currency or {},
+            }
+            for goal in META_GOAL_PRIORITY:
+                cfg = META_GOALS[goal]
+                try:
+                    if cfg["threshold_check"](state):
+                        fam = cfg.get("target_family")
+                        fam_txt = (f" — consider set_strategy with target_family "
+                                   f"'{fam}'") if fam else ""
+                        return (f"Suggested direction: {goal} "
+                                f"({cfg['description']}{fam_txt}).")
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return ""
 
     def _count_stations_on_board(self, board, family: str) -> dict[int, int]:
         """count stations of `family` on the board, grouped by level.
@@ -3193,7 +4093,10 @@ class VisionDrivenPlanner(Planner):
         if name == "buy_station":
             if self.shop is None:
                 return '{"error": "buying unavailable in this mode"}'
-            family = str(args.get("family") or "").strip().lower()
+            # All family intake canonicalizes (model emits spaced display
+            # names — "supply cupboard" — per display_family; the board,
+            # caches, and guards all use compact canonical ids).
+            family = canonical_family(args.get("family"))
             if not family:
                 return '{"error": "buy_station requires family"}'
                 # strategy-family enforcement (B1) — if the committed
@@ -3248,6 +4151,13 @@ class VisionDrivenPlanner(Planner):
             self._last_currency_result = res
             self._last_currency_step = self._step_count
             self._currency = res.get("currency")
+            # Stamp the feats tier on no-card misses: a family absent from
+            # the sheet while locked slots exist is unlock-gated, not
+            # rune-gated — the compel gate compares this tier to skip
+            # rescanning until progression happens.
+            if (res.get("error") or "").startswith("no ") and res.get("locked"):
+                res["_tier_at_miss"] = (self._feats_cache or {}).get("tier")
+                self._last_currency_result = res
             # two-phase state machine.
             # - confirm=false + dialog verified + affordable + bought not
             #   yet: stash the pending buy for the model to confirm.
@@ -3284,6 +4194,28 @@ class VisionDrivenPlanner(Planner):
                             item=res.get("placed_item"),
                             cell=res.get("cell"),
                             error=res.get("error"))
+            return json.dumps(res)
+        if name == "collect_feat_rewards":
+            if self.panels is None:
+                return '{"error": "feat collection unavailable in this mode"}'
+            if self._frame is None:
+                return '{"error": "no frame for feat collection"}'
+            try:
+                res = self.panels.collect_feat_rewards(self._frame)
+            except Exception as exc:
+                return json.dumps({"error": f"feat collection failed: {exc}"})
+            self._last_feat_collect_step = self._step_count
+            panel = res.get("panel") or {}
+            feats = panel.get("feats") or []
+            if feats:
+                self._feats_cache = {"tier": panel.get("tier"), "feats": feats,
+                                     "step": self._step_count}
+            collected = int(res.get("collected") or 0)
+            self._last_feat_collect_found = collected > 0 or bool(res.get("tier"))
+            if collected:
+                self.log.log("feat_reward_collected", count=collected, via="tool")
+            if res.get("tier"):
+                self.log.log("tier_reward_collected", tier=panel.get("tier"), via="tool")
             return json.dumps(res)
         if name == "identify_item":
             # support BATCH identification. The `cells` parameter
@@ -3346,12 +4278,49 @@ class VisionDrivenPlanner(Planner):
                 target.item_id = item_id
                 target.score = 1.0
                 target.margin = 1.0
-                self._bank_popup_recipe(item_id, info)
+                info = info or {}
+                # Genuine-new-item path with two-source agreement: an id
+                # whose base is NOT banked (first sighting, e.g. eyeball)
+                # gets its sprite + recipe banked only when the popup OCR
+                # title independently agrees with the resolved name
+                # ("Eyeball" vs "eyeball"). A hallucinated LLM name against
+                # a disagreeing OCR title banks nothing anywhere — the
+                # board label above is step-local and evaporates on next
+                # classify. Known ids keep the existing unconditional path.
+                bank_ok = True
+                if (self.classifier is not None
+                        and not self.classifier.has(item_id)):
+                    ocr_name = normalize_item_name(info.get("ocr") or "")
+                    base = (item_id.split("_lvl")[0]
+                            if "_lvl" in (item_id or "") else (item_id or ""))
+                    bank_ok = bool(ocr_name) and (
+                        ocr_name == base or base in ocr_name
+                        or ocr_name in base)
+                    if not bank_ok:
+                        # Consensus fallback: independent popup reads that
+                        # keep naming the same id (e.g. LLM says "eyeball"
+                        # 3+ times while OCR mangles it as "fuehball") are
+                        # themselves a second source. Without this, a new
+                        # minion whose OCR is degraded can NEVER be banked
+                        # (observed: 12 consecutive eyeball refusals) and
+                        # the bot re-taps the popup forever.
+                        bank_ok = self._unbanked_consensus(
+                            target, item_id)
+                        if not bank_ok:
+                            self.log.log("identify_unbanked",
+                                         cell=[target.row, target.col],
+                                         item=item_id, ocr=info.get("ocr"))
+                if bank_ok:
+                    self._bank_popup_recipe(item_id, info)
+                    try:
+                        self._bank_unid_sprite(target, item_id)
+                    except Exception:
+                        pass
                 results.append({
                     "item_id": item_id,
                     "cell": [target.row, target.col],
-                    "merge_info": (info or {}).get("merge_info") or "",
-                    "description": (info or {}).get("description") or "",
+                    "merge_info": info.get("merge_info") or "",
+                    "description": info.get("description") or "",
                 })
             return json.dumps({"results": results})
         if name == "lookup_wiki":
@@ -3460,10 +4429,28 @@ class VisionDrivenPlanner(Planner):
         unids = self._unidentified_cells(board)
         if not unids:
             return
+        # Prioritize UNIDs that can act THIS step: cells sharing a family
+        # hint (labeled id or runner-up guess) with another UNID are likely
+        # a mergeable pair once identified — identifying a lone UNID banks
+        # a template but rarely unblocks a move. Board order breaks ties.
+        # (Cap still MAX_DISCOVERY; the optional round can do more.)
+        from collections import Counter
+        hints = Counter()
+        for (r, c) in unids:
+            t = board.cell_at(r, c)
+            h = (t.item_id or t.runner_up_id) if t is not None else None
+            if h:
+                hints[h] += 1
+
+        def _prio(rc) -> tuple:
+            t = board.cell_at(rc[0], rc[1])
+            h = (t.item_id or t.runner_up_id) if t is not None else None
+            return (0 if h and hints[h] >= 2 else 1, rc[0], rc[1])
+
         # Cap at MAX_DISCOVERY cells per step (the model can call more
         # in the optional-tools round if it wants).
         targets = []
-        for (r, c) in unids:
+        for (r, c) in sorted(unids, key=_prio):
             if (r, c) == necromerger_cell():
                 continue
             target = board.cell_at(r, c)
@@ -3661,14 +4648,19 @@ class VisionDrivenPlanner(Planner):
             "Never merge a Champion with anything — Champions are unique "
             "enemies, not merge pieces."),
         "spawn_not_grave": (
-            "Only a Grave or a Chest can spawn a creature — spawning from any "
-            "other cell type no-ops."),
+            "Only a Grave, a Chest, or a Supply Cupboard can spawn — "
+            "spawning from any other cell type no-ops."),
         "spawn_no_room": (
             "Cannot spawn onto a full board — merge or feed first to free a "
             "cell."),
         "spawn_low_mana": (
             "A Grave spawn needs the Mana bar above the minimum threshold — "
-            "wait or collect Mana before spawning."),
+            "wait or collect Mana before spawning. "
+            + _resource_teaching("mana")),
+        "spawn_no_slime": (
+            "A Supply Cupboard spawn needs Slime in the vat — spawning on "
+            "empty Slime silently no-ops. Merge/feed instead until Slime "
+            "regenerates. " + _resource_teaching("slime")),
         "feed_mana": (
             "Never feed a Mana item for Satiety — it grants Mana instead."),
         "attack_no_damage": (
@@ -4038,33 +5030,64 @@ class VisionDrivenPlanner(Planner):
 
     def _feed_values(self) -> dict[str, int]:
         """Template id -> numeric feed value (how much Food the Devourer gains
-        when that item is fed), from `feed value:` facts in `(popup)` blocks.
-        Items without a recorded feed value are absent from the dict."""
-        if not self.glossary_path.exists():
-            return {}
-        text = self.glossary_path.read_text()
-        values: dict[str, int] = {}
-        for m in re.finditer(r"## Item ([a-z0-9_]+) \(popup\)\n(.*?)(?=\n## |\Z)",
-                                "\n" + text, re.S):
-            fm = re.search(r"-\s*feed value\s*:\s*(\d+)", m.group(2))
-            if fm:
-                values[m.group(1)] = int(fm.group(1))
-        return values
+        when that item is fed), from `feed value:` facts. Precedence: the
+        planner's own knowledge dir (live runs bank here) > its own markdown
+        glossary (tests + legacy saves own their file) > the default JSON
+        dir, but ONLY when default-configured (otherwise temp-path tests
+        would leak live data)."""
+        try:
+            from planner.glossary import read_feed_values, _get_knowledge_dir, DEFAULT_PATH
+            kd = _get_knowledge_dir(self.glossary_path) if self.glossary_path else None
+            if kd is not None and kd.exists():
+                vals = read_feed_values(kd)
+                if vals:
+                    return vals
+            if self.glossary_path is not None and Path(self.glossary_path).exists():
+                text = Path(self.glossary_path).read_text()
+                values: dict[str, int] = {}
+                for m in re.finditer(r"## Item ([a-z0-9_]+) \(popup\)\n(.*?)(?=\n## |\Z)",
+                                        "\n" + text, re.S):
+                    fm = re.search(r"-\s*feed value\s*:\s*(\d+)", m.group(2))
+                    if fm:
+                        values[m.group(1)] = int(fm.group(1))
+                return values
+            if self.glossary_path is not None and Path(self.glossary_path) == DEFAULT_PATH:
+                vals = read_feed_values()
+                if vals:
+                    return vals
+        except Exception:
+            pass
+        return {}
 
     def _damage_values(self) -> dict[str, int]:
-        """Template id -> numeric Damage value from `damage value:` facts in
-        `(popup)` blocks (the "Takes Damage" column — damage dealt if dropped
-        on a Champion). Items without a recorded damage stat are absent."""
-        if not self.glossary_path.exists():
-            return {}
-        text = self.glossary_path.read_text()
-        values: dict[str, int] = {}
-        for m in re.finditer(r"## Item ([a-z0-9_]+) \(popup\)\n(.*?)(?=\n## |\Z)",
-                                "\n" + text, re.S):
-            fm = re.search(r"-\s*damage value\s*:\s*(\d+)", m.group(2))
-            if fm:
-                values[m.group(1)] = int(fm.group(1))
-        return values
+        """Template id -> numeric Damage value from `damage value:` facts
+        (the "Takes Damage" column — damage dealt if dropped on a Champion).
+        Same precedence as `_feed_values`: own knowledge dir > own markdown
+        > default JSON only when default-configured. Items without a
+        recorded damage stat are absent."""
+        try:
+            from planner.glossary import read_damage_values, _get_knowledge_dir, DEFAULT_PATH
+            kd = _get_knowledge_dir(self.glossary_path) if self.glossary_path else None
+            if kd is not None and kd.exists():
+                vals = read_damage_values(kd)
+                if vals:
+                    return vals
+            if self.glossary_path is not None and Path(self.glossary_path).exists():
+                text = Path(self.glossary_path).read_text()
+                values: dict[str, int] = {}
+                for m in re.finditer(r"## Item ([a-z0-9_]+) \(popup\)\n(.*?)(?=\n## |\Z)",
+                                        "\n" + text, re.S):
+                    fm = re.search(r"-\s*damage value\s*:\s*(\d+)", m.group(2))
+                    if fm:
+                        values[m.group(1)] = int(fm.group(1))
+                return values
+            if self.glossary_path is not None and Path(self.glossary_path) == DEFAULT_PATH:
+                vals = read_damage_values()
+                if vals:
+                    return vals
+        except Exception:
+            pass
+        return {}
 
     def _per_level_spawn_outputs(self, item_id: str) -> tuple[list[str], list[int]] | None:
         """Look up the per-level spawn outputs and rates for `item_id` from
@@ -4095,18 +5118,37 @@ class VisionDrivenPlanner(Planner):
         return item_id in stats or item_id in markers
 
     def _max_level_ids(self) -> set[str]:
-        """Template ids whose glossary popup block records `max_level: true`
-        (their popup says only "Feed to the Devourer.", no merge line)."""
-        if not self.glossary_path.exists():
-            return set()
-        text = self.glossary_path.read_text()
-        ids = set()
-        # Glossary blocks look like: "## Item <id> (popup)\n- max_level: true"
-        for m in re.finditer(r"## Item ([a-z0-9_]+) \(popup\)\n(.*?)(?=\n## |\Z)",
-                                "\n" + text, re.S):
-            if "max_level: true" in m.group(2):
-                ids.add(m.group(1))
-        return ids
+        """Template ids at max level (popup says only "Feed to the Devourer.",
+        no merge line). Same precedence as `_feed_values`: own knowledge dir
+        > own markdown > default JSON only when default-configured. An empty
+        set here disables EVERY max-level gate (merge_max_level, income
+        whitelist, feed ranking), so the JSON fallback is load-bearing, not
+        cosmetic."""
+        try:
+            from planner.glossary import read_item_stats, _get_knowledge_dir, DEFAULT_PATH
+            kd = _get_knowledge_dir(self.glossary_path) if self.glossary_path else None
+            if kd is not None and kd.exists():
+                stats = read_item_stats(kd)
+                ids = {k for k, v in stats.items() if v.get("max_level")}
+                if ids:
+                    return ids
+            if self.glossary_path is not None and Path(self.glossary_path).exists():
+                text = Path(self.glossary_path).read_text()
+                ids = set()
+                # Glossary blocks look like: "## Item <id> (popup)\n- max_level: true"
+                for m in re.finditer(r"## Item ([a-z0-9_]+) \(popup\)\n(.*?)(?=\n## |\Z)",
+                                        "\n" + text, re.S):
+                    if "max_level: true" in m.group(2):
+                        ids.add(m.group(1))
+                return ids
+            if self.glossary_path is not None and Path(self.glossary_path) == DEFAULT_PATH:
+                stats = read_item_stats()
+                ids = {k for k, v in stats.items() if v.get("max_level")}
+                if ids:
+                    return ids
+        except Exception:
+            pass
+        return set()
 
     @staticmethod
     def _parse_chain_line(line: str):
@@ -4244,6 +5286,7 @@ class VisionDrivenPlanner(Planner):
         max_level = self._max_level_ids()
         feed_values = self._feed_values()
         damage_values = self._damage_values()
+        chain_map = self._chain_map()
         for cell in board.cells:
             if cell.item_id is None:
                 continue
@@ -4266,9 +5309,59 @@ class VisionDrivenPlanner(Planner):
             tag += f" (feed {fv})" if fv else ""
             dv = damage_values.get(cell.item_id)
             tag += f" (dmg {dv})" if dv else ""
-            known.append((cell.row, cell.col, cell.item_id + tag, cell.score, cell.margin))
+            if (fv is None and feed_values and cell.item_id not in max_level
+                    and not is_merge_material(
+                        cell.item_id, chain_map=chain_map,
+                        max_level_ids=max_level)):
+                tag += " [UNKNOWN VALUE — do not feed]"
+            known.append((cell.row, cell.col, cell.item_id, tag, cell.score, cell.margin))
         unidentified = self._unidentified_cells(board)
         empty = sum(1 for c in board.cells if not c.occupied)
+        # Per-cell legality tags: the 4B model cannot reliably multi-hop
+        # `(feed N)` + `Satiety R remaining` + mana% + empty-count across
+        # distant lines, so render the verdict on the line itself. Tags use
+        # the same gates as the validator (satiety tolerance, SPAWN_MANA_MIN)
+        # so a tagged cell validates. Guards: skip tags when the context the
+        # gate needs (satiety/mana) is unavailable.
+        try:
+            remaining = getattr(self.fallback, "satiety_remaining", None)
+            capacity = getattr(self.fallback, "satiety_capacity", None)
+            tol = (SATIETY_TOL_FRACTION * capacity
+                   if remaining is not None and capacity else 0)
+            mana = getattr(self, "_mana_fraction", None)
+            legible = []
+            for r, c, iid, tag, s, m in known:
+                cell = board.cell_at(r, c)
+                is_champ = any(iid.startswith(p) for p in CHAMPION_PREFIXES)
+                is_station = any(iid.startswith(p) for p in STATION_PREFIXES)
+                if not is_champ and not is_station:
+                    fvv = feed_values.get(iid)
+                    if fvv is not None and remaining is not None and remaining > 0:
+                        tag += (" [FEEDABLE]" if fvv <= remaining + tol
+                                else f" [feed exceeds {remaining:.0f} remaining]")
+                if not is_champ:
+                    if any(iid.startswith(p) for p in ("grave",) + CHEST_PREFIXES):
+                        if empty <= 0:
+                            tag += " [spawn blocked: board full]"
+                        elif iid.startswith("grave") and mana is not None and mana < SPAWN_MANA_MIN:
+                            tag += " [spawn blocked: mana low]"
+                        else:
+                            tag += " [SPAWNABLE]"
+                    elif any(iid.startswith(p) for p in SLIME_SPAWN_PREFIXES):
+                        slime = getattr(getattr(self, "fallback", None),
+                                        "slime_count", None)
+                        if empty <= 0:
+                            tag += " [spawn blocked: board full]"
+                        elif slime is not None and slime <= 0:
+                            tag += " [spawn blocked: slime empty]"
+                        elif self._wants_eye_components(board):
+                            tag += " [SPAWNABLE]"
+                    if iid in max_level:
+                        tag += " [NEVER MERGE]"
+                legible.append((r, c, iid + tag, s, m))
+            known = legible
+        except Exception:
+            pass
         lines = ["Occupied cells (template bank labels):"]
         if known:
             for r, c, iid, s, m in sorted(known):
@@ -4276,7 +5369,10 @@ class VisionDrivenPlanner(Planner):
         else:
             lines.append("- (none)")
         lines.append(f"Unidentified occupied cells: {sorted(unidentified)}")
-        lines.append(f"Empty cells: {empty} of {board.rows * board.cols}")
+        lines.append(f"Empty cells ({empty} of {board.rows * board.cols}): "
+                     + (", ".join(f"({c.row},{c.col})" for c in board.cells
+                                  if not c.occupied)
+                        if empty else "none — board is FULL"))
         if self.hints:
             # --no-hints: omit the computed Best-move line so the model must
             # reason from feats/craving/satiety/board state instead of echoing
@@ -4296,13 +5392,39 @@ class VisionDrivenPlanner(Planner):
         craving = self._craving_line_text()
         if craving:
             lines.append(craving)
+        # Craving producer gap: the craved item cannot be made from anything
+        # on the board (no item, no producer station). Name the station to
+        # buy so the model can act instead of working around a craving it
+        # can never satisfy. Absent when satisfiable or unmapped.
+        need = self._craving_station_need(board)
+        if need:
+            craving_item = ((self._craving_cache or {}).get("item")
+                            or self._last_craving or self.fallback.craved_item)
+            disp = display_family(need)
+            # Locked beats poor: if the last full scan found no card while
+            # locked slots exist, runes are not the blocker — progression is.
+            last = self._last_currency_result or {}
+            locked_reqs = []
+            if (isinstance(last, dict) and last.get("family") == need
+                    and (last.get("error") or "").startswith("no ")):
+                locked_reqs = last.get("locked") or []
+            if locked_reqs:
+                req = "; ".join(locked_reqs)
+                lines.append(f"Craving {craving_item}: {disp} is LOCKED ({req}) — "
+                             f"complete feats to unlock it; gathering runes won't help yet. "
+                             f"Do not open the Station panel for it.")
+            else:
+                lines.append(f"Craving {craving_item} has no producer on the board — buy {disp} "
+                             f"from the Station panel (call buy_station(\"{disp}\", confirm=false)) "
+                             f"to start the chain. Do not wait for the item to appear.")
         champion = self._champion_line_text()
         if champion:
             lines.append(champion)
         bar = self._bottom_bar_line_text()
         if bar:
             lines.append(bar)
-        runes = self._currency_line_text()
+        runes = self._currency_line_text(
+            need_family=self._strategy_family or self._craving_station_need(board))
         if runes:
             lines.append(runes)
         feats = self._feats_line_text()
@@ -4311,6 +5433,12 @@ class VisionDrivenPlanner(Planner):
         strategy = self._strategy_line_text(board=board)
         if strategy:
             lines.append(strategy)
+        else:
+            # No committed strategy — show the code-evaluated meta-goal
+            # direction (replaces the retired periodic StrategyPlanner).
+            direction = self._suggested_direction(board)
+            if direction:
+                lines.append(direction)
             # cross-step rejection reminder. The model is shown its
         # previous step's last rejected action with a one-line reason, so
         # the next decision starts informed (e.g. "Last step rejected:
@@ -4321,7 +5449,172 @@ class VisionDrivenPlanner(Planner):
         # the WHY forward.
         if self._cross_step_rejected:
             lines.append(self._rejection_line_text(self._cross_step_rejected))
+        # Whitelist of valid moves not yet rejected — constrains the model's
+        # action space so it cannot keep re-proposing the same invalid pair.
+        # Without this the model re-samples the same high-prior move even
+        # though the validator has already rejected it and the correction
+        # says "do NOT propose these again". The whitelist is computed from
+        # the same ranked groups the validator will accept, filtered by the
+        # in-step + cross-step rejected set so stale options are not shown.
+        whitelist = self._whitelist_line_text(board)
+        if whitelist:
+            lines.append(whitelist)
+        # Decision checklist, LAST line (recency): the model follows a short
+        # numbered list better than distant prose. Mirrors the HARD RULES.
+        lines.append("Decision checklist: 1. Pick ONLY a move from the Choose ONLY from line"
+                     " (or a Best hint); prefer [FEEDABLE]/[SPAWNABLE] cells. 2. Never repeat a"
+                     " rejected move; never merge [NEVER MERGE] cells; never output a tool name."
+                     " 3. Reply with ONLY the JSON action.")
         return "\n".join(lines)
+
+    def _whitelist_line_text(self, board, rejected: set | None = None) -> str | None:
+        """Compact whitelist of valid moves the model may still choose.
+
+        Enumerates the top valid merges (via ranked_merge_groups), spawn
+        stations (grave/chest), and attack pairs — all filtered by the
+        rejected set so already-rejected moves are never suggested again.
+        Feed is not enumerated because its validity depends on satiety/mana
+        which the validator checks; listing it would risk suggesting an
+        overflow feed. The line is short (<=3 merges, <=2 spawns) so it
+        does not dominate the board state. When no moves are enumerated
+        (e.g. empty board, all merges rejected) returns None.
+        """
+        if rejected is None:
+            # In _board_state_text we want cross-step + in-step blocks
+            # reflected, but _board_state_text is called before _drive
+            # builds the per-step rejected set. At that point only
+            # cross-step is known; in-step filtering happens in the
+            # correction loop via _correction. So here we filter only
+            # cross-step; the loop's correction handles in-step.
+            rejected = set((r["kind"], r["cell_a"], r["cell_b"])
+                           for r in (self._cross_step_rejected or []))
+        empty = sum(1 for c in board.cells if not c.occupied)
+        congested = empty <= 3
+        parts = []
+        # Feeds (max-level income) first when congested — freeing a full
+        # board by feeding a max stack outranks merging. When not congested
+        # feeds are listed last so merges outrank them via kind_order.
+        feed_parts = []
+        try:
+            max_level = self._max_level_ids() or set()
+            for cell in board.cells:
+                if not cell.item_id or not cell.occupied:
+                    continue
+                if cell.item_id not in max_level:
+                    continue
+                if not any(cell.item_id.startswith(fam) or fam in cell.item_id
+                           for fam in ("icerune", "poisonrune", "bloodrune", "moonrune", "deathrune", "coins", "coin")):
+                    continue
+                if any(cell.item_id.startswith(p) for p in STATION_PREFIXES):
+                    continue
+                if any(cell.item_id.startswith(p) for p in CHAMPION_PREFIXES):
+                    continue
+                key = ("feed", (cell.row, cell.col), None)
+                if key in rejected:
+                    continue
+                feed_parts.append(f"feed ({cell.row},{cell.col}) {cell.item_id} (max level)")
+                if len(feed_parts) >= 2:
+                    break
+            if feed_parts and congested:
+                parts.append("Valid feeds: " + "; ".join(feed_parts))
+        except Exception:
+            pass
+        # Merges — top 3 by value, not rejected, not noop-excluded
+        try:
+            ranked = ranked_merge_groups(
+                board, max_level_ids=self._max_level_ids(),
+                chain_map=self._chain_map(),
+                craved_item=self._last_craving or self.fallback.craved_item,
+                craved_level=self.fallback.craved_level,
+                craved_need=self._craving_need_remaining(),
+                exclude_pairs=self._noop.excluded())
+            merges = []
+            for item_id, cells in ranked:
+                if len(cells) < 2:
+                    continue
+                # ranked is grouped by item_id; within a group cells are
+                # already sorted. Take the first pair per group as the
+                # representative. Filter rejected.
+                a, b = cells[0], cells[1]
+                key = ("merge", (a.row, a.col), (b.row, b.col))
+                # also check swapped order — model may propose either
+                swapped = ("merge", (b.row, b.col), (a.row, a.col))
+                if key in rejected or swapped in rejected:
+                    # try next pair in group if available
+                    found = False
+                    for i in range(1, len(cells) - 1):
+                        a2, b2 = cells[i], cells[i + 1]
+                        k2 = ("merge", (a2.row, a2.col), (b2.row, b2.col))
+                        s2 = ("merge", (b2.row, b2.col), (a2.row, a2.col))
+                        if k2 not in rejected and s2 not in rejected:
+                            merges.append(f"merge {item_id} ({a2.row},{a2.col})+({b2.row},{b2.col})")
+                            found = True
+                            break
+                    if found:
+                        continue
+                    continue
+                merges.append(f"merge {item_id} ({a.row},{a.col})+({b.row},{b.col})")
+                if len(merges) >= 3:
+                    break
+            if merges:
+                parts.append("Valid merges: " + "; ".join(merges))
+        except Exception:
+            pass
+        # Spawns — any grave/chest/cupboard not rejected, but NOT when
+        # board is full (spawn_no_room). Listing a spawn on a 0/20 board
+        # tricks the model into a guaranteed `spawn_no_room` rejection.
+        # Cupboards list only when wanted (slime cost + clog risk).
+        if empty > 0:
+            try:
+                spawns = []
+                want_eye = self._wants_eye_components(board)
+                for cell in board.cells:
+                    if cell.item_id is None:
+                        continue
+                    is_spawn = any(cell.item_id.startswith(p)
+                                   for p in ("grave",) + CHEST_PREFIXES)
+                    is_cup = (want_eye and any(
+                        cell.item_id.startswith(p) for p in SLIME_SPAWN_PREFIXES))
+                    if not (is_spawn or is_cup):
+                        continue
+                    key = ("spawn", (cell.row, cell.col), None)
+                    # _drive's rejected set stores (kind, cell_a, cell_b) where
+                    # cell_b is None for spawns. Check both None and tuple forms.
+                    if key in rejected or ("spawn", (cell.row, cell.col), (cell.row, cell.col)) in rejected:
+                        continue
+                    spawns.append(f"spawn ({cell.row},{cell.col}) {cell.item_id}")
+                    if len(spawns) >= 2:
+                        break
+                if spawns:
+                    parts.append("Valid spawns: " + "; ".join(spawns))
+            except Exception:
+                pass
+        # Feeds when not congested — listed after merges/spawns
+        if feed_parts and not congested:
+            parts.append("Valid feeds: " + "; ".join(feed_parts))
+        # Attacks — best attacker with known damage onto champion
+        try:
+            dmg = self._damage_values() or getattr(self.fallback, "damage_values", {}) or {}
+            pair = best_attack_pair(board, damage_values=dmg)
+            if pair is not None:
+                atk, champ, dv = pair
+                key = ("attack", (atk.row, atk.col), (champ.row, champ.col))
+                # also check if this specific pair was rejected
+                if key not in rejected:
+                    parts.append(f"Valid attack: attack {atk.item_id} ({atk.row},{atk.col}) -> {champ.item_id} ({champ.row},{champ.col}) dmg {dv}")
+        except Exception:
+            pass
+        if not parts:
+            return None
+        return "Choose ONLY from: " + " | ".join(parts) + " — do NOT repeat any rejected move."
+
+    def _whitelist_snippet(self, board, rejected: set | None = None) -> str:
+        """Short whitelist for inline corrections (single line, no prefix)."""
+        line = self._whitelist_line_text(board, rejected=rejected)
+        if not line:
+            return "no valid merges/spawns enumerated — try collect or feed a low-value creature."
+        # Strip the leading "Choose ONLY from: " for inline use
+        return line.replace("Choose ONLY from: ", "", 1)
 
     def _best_merge_line(self, board) -> str:
         """Best-valued merge as a hint, e.g.
@@ -4356,6 +5649,8 @@ class VisionDrivenPlanner(Planner):
         craved = self._last_craving or self.fallback.craved_item
         ranked = ranked_merge_groups(board, max_level_ids=self._max_level_ids(),
                                         chain_map=self._chain_map(), craved_item=craved,
+                                        craved_level=self.fallback.craved_level,
+                                        craved_need=self._craving_need_remaining(),
                                         exclude_pairs=self._noop.excluded())
                                         # strategy-prioritized merge. When the active strategy
         # names a station (Build-a-X or Own-a-Lvl-N+-X), find a mergeable
@@ -4452,7 +5747,9 @@ class VisionDrivenPlanner(Planner):
         feed_active = self._feed_objective_active() or income is not None
         merge_available = bool(ranked_merge_groups(
             board, max_level_ids=max_level, chain_map=self._chain_map(),
-            craved_item=craved, exclude_pairs=self._noop.excluded()))
+            craved_item=craved, craved_level=craved_level,
+            craved_need=self._craving_need_remaining(),
+            exclude_pairs=self._noop.excluded()))
         if not _should_feed(board, target, empty_count,
                             max_level_ids=max_level, feed_values=feed_values,
                             craved_item=craved, craved_level=craved_level,
@@ -4496,6 +5793,30 @@ class VisionDrivenPlanner(Planner):
         income = self._best_income_line(board)
         merge = self._best_merge_line(board)
         spawn = self._best_spawn_line(board)
+        # Hard priority: when the board is full (0 empty) and a max-level
+        # income stack sits on it, feeding that stack frees a cell and banks
+        # currency — merging anything else (bone, ribcage) keeps the board
+        # clogged. The kind_order (feat-driven) would still return `merge`
+        # first when no build strategy is active, so the model merges the
+        # two icerune_lvl3 (max) — which the validator then refuses as
+        # `merge_max_level`. Force the income/feed hint ahead of merge when
+        # congested. Observed: board 0/20 empty with 2 icerune_lvl3, model
+        # tried `merge (1,0)+(3,2)` instead of `feed`.
+        empty = sum(1 for c in board.cells if not c.occupied)
+        if empty <= 3 and income:
+            return income
+        if empty <= 3 and feed and any(c.item_id in (self._max_level_ids() or set()) for c in board.cells if c.item_id):
+            # fallback: even if income is None (no build strategy), a plain
+            # max-level feed is still better than merging when congested
+            max_feed = None
+            for c in board.cells:
+                if c.item_id in (self._max_level_ids() or set()) and c.occupied:
+                    # prefer the max-level income family already filtered
+                    if any(c.item_id.startswith(f) for f in ("icerune","poisonrune","bloodrune","moonrune","deathrune","coin")):
+                        max_feed = c
+                        break
+            if max_feed is not None and feed:
+                return feed
         for kind in kind_order(self._feat_weights(board)):
             if kind == "attack" and attack:
                 return attack
@@ -4559,8 +5880,15 @@ class VisionDrivenPlanner(Planner):
         # "Always useful" income families don't require a build strategy —
         # they're spent in the Shop / Wobulan trades regardless of what the
         # bot is currently building. Rune families need a build strategy
-        # because Runes are only useful when saving for a specific station.
+        # because Runes are only useful when saving for a specific station —
+        # EXCEPT when the board is congested (≤3 empty cells): a max-level
+        # rune stack occupying a cell blocks spawns/merges, so feeding it
+        # to free space and bank currency is useful even without an active
+        # build goal (observed: board full 0/20 empty with 2 icerune_lvl3,
+        # no strategy active, feed never hinted, board stalled).
         always_useful = {"coin", "gem"}
+        empty = sum(1 for c in board.cells if not c.occupied)
+        congested = empty <= 3
         candidates = []   # (feed_value, item_id, row, col, label, who)
         for c in board.cells:
             if not c.item_id:
@@ -4571,14 +5899,20 @@ class VisionDrivenPlanner(Planner):
                     if base.startswith(f) or f in base), None)
             if matched is None:
                 continue
+            # Rune income without a build strategy is only useful when congested
+            if matched not in always_useful and not congested:
+                if not (self._strategy and self._strategy_fresh()
+                        and self._strategy.get("kind") == "station"):
+                    continue
                 # only max-level income stacks qualify. A coin_lvl1
             # or ice_rune_lvl1 is not a valid feed target — feeding it
             # would waste the currency vs. merging it up first.
             if c.item_id not in self._max_level_ids():
                 continue
             # Build strategy gate: Rune families need an active build
-            # strategy; Coin + Gem fire unconditionally.
-            if matched not in always_useful and not is_build_strategy(self._strategy):
+            # strategy; Coin + Gem fire unconditionally. EXCEPT when
+            # congested — see comment above.
+            if matched not in always_useful and not congested and not is_build_strategy(self._strategy):
                 continue
             # Per-feed currency label per family.
             if matched.endswith("rune"):
@@ -4701,6 +6035,30 @@ class VisionDrivenPlanner(Planner):
             what = "/".join(CHEST_SPAWN_PREFIXES)
             return (f"Best spawn: {cell.item_id} ({cell.row},{cell.col}) "
                     f"-> {what} ({empty} empty)")
+        # Supply cupboard (Slime cost) — hinted ONLY when something wants
+        # eye components: an eyemonster/eyeball/eyeinjar craving, or a
+        # strategy targeting the cupboard/eye family. Otherwise a cupboard
+        # tap spends Slime and clogs the board for no objective.
+        if self._wants_eye_components(board):
+            cup_candidates = [
+                c for c in board.cells
+                if c.item_id
+                and any(c.item_id.startswith(p) for p in SLIME_SPAWN_PREFIXES)
+                and not _is_excluded(c)]
+            cup_candidates.sort(key=lambda c: (-_cell_level(c), c.row, c.col))
+            if cup_candidates:
+                cell = cup_candidates[0]
+                slime = getattr(getattr(self, "fallback", None),
+                                "slime_count", None)
+                if slime is not None and slime <= 0:
+                    pass  # vat known-empty: cupboard would no-op, skip
+                else:
+                    per_level = self._per_level_spawn_outputs(cell.item_id)
+                    what = "eyeball"
+                    if per_level is not None and per_level[0]:
+                        what = " / ".join(per_level[0])
+                    return (f"Best spawn: {cell.item_id} ({cell.row},{cell.col}) "
+                            f"-> {what} (costs Slime) ({empty} empty)")
         if grave_candidates:
             cell = grave_candidates[0]
             if mana is not None and mana < SPAWN_MANA_MIN:
@@ -4740,9 +6098,15 @@ class VisionDrivenPlanner(Planner):
         return ""
 
     def _bottom_bar_line_text(self) -> str:
-        """Bottom-bar dock state, e.g. 'Bottom bar: feats(station queue) unlocked,
-        spellbook/shop locked'. Empty when the dock is not visible (panel open /
-        non-lair frame), so the LLM knows it cannot interact with buttons."""
+        """Bottom-bar dock state, e.g. 'Bottom bar: unlocked feats,station,queue(reward),
+        locked spellbook,shop'. Empty when the dock is not visible (panel open /
+        non-lair frame), so the LLM knows it cannot interact with buttons.
+
+        The queue reward flag is the model's ONLY signal for when to call
+        collect_queue (the tool is offered every step but nothing else says
+        when a reward is queued — observed: zero queue_collected events in
+        3329 session lines). has_reward is a free pixel check (no tap, no
+        panel), so it runs inline here."""
         if self.bottombar is None or self._frame is None:
             return ""
         try:
@@ -4756,6 +6120,18 @@ class VisionDrivenPlanner(Planner):
             return ""
         if not unlocked and not locked:
             return ""
+        queue_flag = ""
+        if "queue" in unlocked:
+            try:
+                from vision.queue_box import has_reward, queued_reward_id, REWARD_DISPLAY
+                if has_reward(self._frame):
+                    rid = queued_reward_id(self._frame)
+                    queue_flag = f"({REWARD_DISPLAY.get(rid, 'reward')})" if rid else "(reward)"
+                else:
+                    queue_flag = "(empty)"
+            except Exception:
+                queue_flag = ""
+        unlocked = [n + queue_flag if n == "queue" else n for n in unlocked]
         return "Bottom bar: " + (
             ("unlocked " + ",".join(unlocked) if unlocked else "") +
             ("  locked " + ",".join(locked) if locked else "")
@@ -4829,7 +6205,13 @@ class VisionDrivenPlanner(Planner):
         frac = getattr(self, "_mana_fraction", None)
         if frac is None:
             return ""
-        return f"Mana: ~{round(frac * 100)}% full"
+        line = f"Mana: ~{round(frac * 100)}% full"
+        # Below the spawn threshold the grave is dead (spawn_low_mana) —
+        # name the producers like the slime line does. Mirrors the
+        # validator condition (SPAWN_MANA_MIN) exactly.
+        if frac < SPAWN_MANA_MIN:
+            line += " (low — " + _resource_teaching("mana", short=True) + ")"
+        return line
 
     def _satiety_remaining(self, frame=None) -> int | None:
         """Devourer satiety capacity - current fill, or None when unreadable.
@@ -4933,8 +6315,15 @@ class VisionDrivenPlanner(Planner):
         cap = self.fallback.slime_capacity
         if cap and cap > 0:
             pct = round(100 * n / cap)
-            return f"Slime: {n} / {cap} (~{pct}% full)"
-        return f"Slime: {n}"
+            line = f"Slime: {n} / {cap} (~{pct}% full)"
+        else:
+            line = f"Slime: {n}"
+        # Empty vat hard-blocks cupboard/fridge spawns (spawn_no_slime) —
+        # name the producers so the model builds toward them instead of
+        # tapping a dead station. Mirrors the validator condition exactly.
+        if n <= 0:
+            line += " (empty — " + _resource_teaching("slime", short=True) + ")"
+        return line
 
     def _craving_objective(self) -> Objective | None:
         """The current craving as a feed objective (None when unknown).
@@ -4999,6 +6388,78 @@ class VisionDrivenPlanner(Planner):
         """True when an active feed/advance feat is present (feed drives)."""
         return any(o.kind == "feed" for o in self._feat_objectives())
 
+    def _wants_eye_components(self, board=None) -> bool:
+        """True when an eye-component spawner is wanted right now.
+
+        Either the craving maps to the Supply Cupboard (CRAVING_PRODUCERS)
+        or a fresh strategy targets the cupboard/eye family. Guards the
+        cupboard spawn hint, whitelist entries, and fallback spawn ranking
+        so cupboard taps (Slime cost, board-clogging eyeballs) only happen
+        with an objective behind them.
+        """
+        try:
+            craving = ((self._craving_cache or {}).get("item")
+                       or self._last_craving
+                       or getattr(self.fallback, "craved_item", None))
+            if craving:
+                cf = normalize_item_name(craving)
+                prod = CRAVING_PRODUCERS.get(cf)
+                if prod is None:
+                    for key, val in CRAVING_PRODUCERS.items():
+                        if cf.startswith(key) or key.startswith(cf):
+                            prod = val
+                            break
+                if prod is not None and prod[0] in SLIME_SPAWN_PREFIXES:
+                    return True
+            s = self._strategy
+            if s and self._strategy_fresh():
+                if s.get("kind") == "station" and (s.get("noun") or "") in SLIME_SPAWN_PREFIXES:
+                    return True
+                noun = (s.get("noun") or "").lower()
+                if s.get("kind") == "creature" and noun in (
+                        "eyemonster", "eyeball", "eyeinjar"):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _craving_station_need(self, board) -> str | None:
+        """Producer-station family the craving needs but the board lacks.
+
+        Returns the family (e.g. 'supplycupboard') when ALL hold: a craving
+        item is known (menu cache, bubble, or fallback), CRAVING_PRODUCERS
+        maps it to a station, NO board cell holds the craved item or its
+        components, and NO station of that family is on the board. Else None.
+        The caller renders the buy line / compels the panel read; a None
+        means the craving is satisfiable from the board (or unmapped) and
+        nothing changes.
+        """
+        craving = ((self._craving_cache or {}).get("item")
+                   or self._last_craving or self.fallback.craved_item)
+        if not craving:
+            return None
+        cf = normalize_item_name(craving)
+        entry = CRAVING_PRODUCERS.get(cf)
+        if entry is None:
+            for key, val in CRAVING_PRODUCERS.items():
+                if cf.startswith(key) or key.startswith(cf):
+                    entry = val
+                    break
+        if entry is None:
+            return None
+        family, components = entry
+        for cell in board.cells:
+            if not cell.item_id or not cell.occupied:
+                continue
+            nid = normalize_item_name(cell.item_id)
+            if (nid == cf or nid.startswith(cf) or cf.startswith(nid)
+                    or nid in components
+                    or any(nid.startswith(c) for c in components)):
+                return None
+            if nid.startswith(family):
+                return None
+        return family
+
     def _craving_line_text(self) -> str:
         """Single merged cravings line for get_board_state.
 
@@ -5015,8 +6476,13 @@ class VisionDrivenPlanner(Planner):
         cache = self._craving_cache
         bubble = self._bubble_craving_item()
         if cache is None:
-            # identity-only cue; empty when no bubble match
-            return f"Cravings (bubble): {bubble}" if bubble else ""
+            # identity-only cue; empty when no bubble match. The level/count
+            # live only in the menu — name the call explicitly, otherwise
+            # the model never takes the optional tool and merges blind
+            # past the craved level (observed Sep 7: two eyemonster_lvl1
+            # merged to lvl2 for a lvl1 craving).
+            return (f"Cravings (bubble): {bubble} (level/count unknown — "
+                    f"call get_cravings)") if bubble else ""
         step = cache.get("step", 0)
         age = max(0, self._step_count - step)
         menu = (f"{cache.get('item')} (lvl {cache.get('level')}) "
@@ -5167,6 +6633,17 @@ class VisionDrivenPlanner(Planner):
         sees the board state the tool round produced.
         """
         msgs, tool_texts = self._strip_tool_history(messages)
+        # Answer round uses the SHORT decision prompt (geometry + hard rules
+        # + schema) instead of the full ~25k-char system prompt: the tool
+        # rounds already ran under the full prompt, and everything the
+        # decision needs (tags, whitelist, hints, checklist) is in the Tool
+        # results below. Falls back to the incoming system message when no
+        # short prompt was staged (tests, offline callers).
+        if getattr(self, "_answer_system", None):
+            for i, m in enumerate(msgs):
+                if m.get("role") == "system":
+                    msgs[i] = {**m, "content": self._answer_system}
+                    break
         if tool_texts:
             joined = "\n\n".join(tool_texts)
             for i, m in enumerate(msgs):
@@ -5230,8 +6707,23 @@ class VisionDrivenPlanner(Planner):
 
     @staticmethod
     def _parse_action(reply: str) -> Move | None:
+        # Strict-then-loose: the thinking model leaks tool-call syntax into
+        # the action answer (observed `{"action":"merge",...}</tool_call>
+        # {"name":...}` fragments). Strip tool-call markup first so a valid
+        # action buried in protocol debris still parses; fall back to the
+        # raw reply (old behavior) when stripping yields nothing.
+        cleaned = re.sub(r"</?tool_call>", "", reply or "")
+        cleaned = re.sub(r"\{\s*\"name\"\s*:.*", "", cleaned).strip()
+        for text in ([cleaned] if cleaned != (reply or "") else []):
+            move = VisionDrivenPlanner._parse_action_json(text)
+            if move is not None:
+                return move
+        return VisionDrivenPlanner._parse_action_json(reply)
+
+    @staticmethod
+    def _parse_action_json(text: str) -> Move | None:
         try:
-            data = _extract_json(reply)
+            data = _extract_json(text)
         except (ValueError, json.JSONDecodeError):
             return None
         action = data.get("action")
@@ -5305,7 +6797,8 @@ class VisionDrivenPlanner(Planner):
                 mana = None
         has_grave = self._graves_on_board(board)
         has_chest = any(
-            c.item_id and any(c.item_id.startswith(p) for p in CHEST_PREFIXES)
+            c.item_id and (any(c.item_id.startswith(p) for p in CHEST_PREFIXES)
+                           or any(c.item_id.startswith(p) for p in SLIME_SPAWN_PREFIXES))
             for c in board.cells)
         if (dominant != "collect" and has_grave and not has_chest
                 and mana is not None and mana < SPAWN_MANA_MIN):
@@ -5352,8 +6845,9 @@ class VisionDrivenPlanner(Planner):
             "merge_is_champion": "that's a Champion (e.g. The Peasant) — champions are enemies and can never be merged.",
             "merge_max_level": "those items are MAX level (their popup says only 'Feed to the Devourer.') — they can never merge again, so feed one to the Devourer instead.",
             "merge_low_margin": "one of those cells doesn't clearly match its label — pick a clearer pair.",
-            "spawn_not_grave": "only the grave can spawn items.",
-            "spawn_low_mana": "the mana bar is too low to spawn — the grave spawn silently no-ops on an empty bar. Collect or feed instead.",
+            "spawn_not_grave": "only a grave, chest, or supply cupboard can spawn items.",
+            "spawn_low_mana": "the mana bar is too low to spawn — the grave spawn silently no-ops on an empty bar. Collect or feed instead. " + _resource_teaching("mana", short=True),
+            "spawn_no_slime": "the slime vat is empty — the cupboard spawn silently no-ops with no Slime. Merge or feed instead. " + _resource_teaching("slime", short=True),
             "spawn_no_room": "the board is FULL — spawns silently no-op with no empty cell. Merge two identical items instead (the board state lists the available pairs) to free space.",
             "collect_mana_full": "the mana bar is already full — collecting is wasted, and a full bar means spawning is EASY right now. Spawn from the grave or merge instead.",
             "feed_is_station": "that cell is a station (grave/necromerger/manapool) — NEVER feed a station to the Devourer. (manapot / manapotion are Potions, NOT stations — they are feedable, but a full Mana bar wastes the feed: see `feed_mana_overflow`.)",
@@ -5399,7 +6893,14 @@ class VisionDrivenPlanner(Planner):
         If `assistant_content` is given, replace the LAST assistant message's
         content with it (used by `_ask_once` to log the full assembled answer
         instead of just the `{"action":` prefill seed).
+
+        Also bumps the per-step LLM round counter (telemetry for the
+        llm_budget event; getattr-guarded for bare test instances).
         """
+        try:
+            self._step_llm_rounds = getattr(self, "_step_llm_rounds", 0) + 1
+        except Exception:
+            pass
         sanitized = []
         for i, m in enumerate(messages):
             content = m["content"]

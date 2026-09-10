@@ -15,6 +15,9 @@ assets/debug/
 assets/review/
 assets/calib/menu/
 
+# Temp files
+item_knowledge/*.tmp 
+
 # Live-screen captures (adb screencaps; the verify-suite fixture frames are
 # currently absent pending re-capture, so ignore the whole dir)
 screenshots/

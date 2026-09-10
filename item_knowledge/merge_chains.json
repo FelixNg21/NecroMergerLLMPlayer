@@ -34,5 +34,15 @@
     ],
     "source": "wiki",
     "updated": "2026-09-02T15:30:29.059335"
+  },
+  "coins": {
+    "chain": [
+      "coins_lvl1",
+      "coins_lvl2",
+      "coins_lvl3",
+      "coins_lvl4"
+    ],
+    "source": "wiki",
+    "updated": "2026-09-05T15:10:27.904838"
   }
 }

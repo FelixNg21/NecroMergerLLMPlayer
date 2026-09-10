@@ -35,5 +35,99 @@
     "uses": 5,
     "source": "popup",
     "updated": "2026-08-31T15:35:18.760069"
+  },
+  "valuablechest": {
+    "targets": [
+      "coins_lvl1",
+      "coins_lvl2",
+      "gems_lvl1"
+    ],
+    "uses": 5,
+    "source": "wiki",
+    "updated": "2026-09-04T05:00:00.000000"
+  },
+  "supplycupboard_lvl1": {
+    "targets": [
+      "eyeball"
+    ],
+    "uses": null,
+    "source": "wiki",
+    "updated": "2026-09-04T05:00:00.000000"
+  },
+  "supplycupboard_lvl2": {
+    "targets": [
+      "eyeball",
+      "eyeinjar"
+    ],
+    "uses": null,
+    "source": "wiki",
+    "updated": "2026-09-04T05:00:00.000000"
+  },
+  "supplycupboard_lvl3": {
+    "targets": [
+      "eyeball",
+      "eyeinjar"
+    ],
+    "uses": null,
+    "source": "wiki",
+    "updated": "2026-09-04T05:00:00.000000"
+  },
+  "supplycupboard_lvl4": {
+    "targets": [
+      "eyeball",
+      "eyeinjar"
+    ],
+    "uses": null,
+    "source": "wiki",
+    "updated": "2026-09-04T05:00:00.000000"
+  },
+  "supplycupboard_lvl5": {
+    "targets": [
+      "eyeball",
+      "eyeinjar"
+    ],
+    "uses": null,
+    "source": "wiki",
+    "updated": "2026-09-04T05:00:00.000000"
+  },
+  "fridge_lvl1": {
+    "targets": [
+      "eyeinjar"
+    ],
+    "uses": null,
+    "source": "wiki",
+    "updated": "2026-09-04T05:00:00.000000"
+  },
+  "fridge_lvl2": {
+    "targets": [
+      "eyeinjar"
+    ],
+    "uses": null,
+    "source": "wiki",
+    "updated": "2026-09-04T05:00:00.000000"
+  },
+  "fridge_lvl3": {
+    "targets": [
+      "eyeinjar"
+    ],
+    "uses": null,
+    "source": "wiki",
+    "updated": "2026-09-04T05:00:00.000000"
+  },
+  "fridge_lvl4": {
+    "targets": [
+      "eyeinjar"
+    ],
+    "uses": null,
+    "source": "wiki",
+    "updated": "2026-09-04T05:00:00.000000"
+  },
+  "fridge_lvl5": {
+    "targets": [
+      "eyeinjar"
+    ],
+    "uses": null,
+    "source": "wiki",
+    "updated": "2026-09-04T05:00:00.000000"
   }
 }

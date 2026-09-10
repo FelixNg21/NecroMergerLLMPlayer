@@ -21,6 +21,8 @@ LLM (y-coords unreliable) — the calibrated constant stays unless re-measured.
 
 import base64
 import json
+from datetime import datetime
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -59,6 +61,34 @@ LAIR_BAND = (150, 1150, 1130, 2380)   # x0, y0, x1, y1
 FLOOR_LOW = (90, 40, 50)              # board/floor tiles' HSV range
 FLOOR_HIGH = (160, 110, 200)
 CLOSE_KERNEL = 61
+
+# Floor-blob validation: the board floor is a WIDE, SHORT strip sitting on
+# the BOTTOM edge of the board region. A menu column, station or dialog that
+# aliases the floor HSV range is typically NARROW or TALL, so it must not be
+# chosen as the board's floor even when it beats the true floor on area. These
+# thresholds are LOSSY on purpose: they only reject components that cannot be
+# the board floor, never the real one. `blob_bottom` feeds origin_y and
+# `blob_width` feeds cell_px, so a wrong largest-component poisons the read.
+BLOB_MIN_BAND_FRAC = 0.30  # width must be >= this fraction of the band width
+BLOB_MAX_ASPECT = 1.6      # height must be < this multiple of width (wide, short)
+# The board floor's bottom edge is the floor line, which sits in the LOWER
+# portion of the lair band (a dialog covering the lower band is not the floor).
+BLOB_MIN_BOTTOM_FRAC = 0.35
+
+# Vertical-extent row discriminator. The floor blob's width feeds cell_px and
+# `origin_y = blob_bottom - rows*cell_px`, so `rows` is NOT determined by the
+# blob at all (4x4 and 5x4 derive identical cell_px and identical template
+# scores — a tie the LLM's unreliable count decides). The physical ground truth
+# is the board's HEIGHT: the tile-grid top edge and the lair floor line. Solving
+# `rows = (blob_bottom - board_top) / cell_px` disambiguates square-ish boards
+# (5x4 spans 5 cells; 4x4 only 4). Measured on a live 5x4: top edge ~1201,
+# floor line ~2342, cell_px 228 -> (2342-1201)/228 = 5.01. Candidates whose
+# implied rows fit the measured span are preferred over the template-objective
+# tie. These tune the top-edge search only.
+TOP_EDGE_EDGE_THR = 40     # vertical-gradient magnitude for a "line" pixel
+TOP_EDGE_MIN_SPAN = 200    # a candidate top edge must span >= this many px
+TOP_EDGE_SEARCH_FRAC = 0.75  # search the top 75% of the lair band for the edge
+VERT_FIT_TOL = 0.45        # rows-fit residual (cells); candidates within this win a bonus
 
 # The mouth is lair-fixed above the board. Only override the calibrated value
 # when the LLM's reading lands in a plausible box around it (y-coords from the
@@ -100,19 +130,54 @@ def _parse_json(text: str) -> dict:
     return json.loads(raw[start : end + 1])
 
 
+# Pinned board dims (Sep 7): the lair grid only changes on board-expansion
+# feat rewards, so its dims are deployment state, not a per-session vision
+# read. The first run without the file detects (LLM prior or full
+# enumeration) and self-seeds it; later runs load it and skip the startup
+# LLM round entirely. A stale pin (board grew since) is caught by the
+# blob-plausibility check, which falls back to full enumeration and
+# re-seeds. Pinning also kills the biggest template-crop variance source:
+# a 4x4-vs-5x4 flip moves origin_y by a whole cell height, shifting every
+# banked crop. Deleting the file forces a fresh detect on next start.
+BOARD_DIMS_PATH = Path(__file__).resolve().parent.parent / "item_knowledge" / "board_dims.json"
+
+
+def read_board_dims(path: str | Path = BOARD_DIMS_PATH) -> tuple[int, int] | None:
+    """Pinned (rows, cols), or None when missing/invalid (caller detects)."""
+    try:
+        data = json.loads(Path(path).read_text())
+        rows, cols = int(data.get("rows", 0)), int(data.get("cols", 0))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    except json.JSONDecodeError:
+        return None
+    return (rows, cols) if _valid_dims(rows, cols) else None
+
+
+def write_board_dims(rows: int, cols: int, source: str = "detected",
+                     path: str | Path = BOARD_DIMS_PATH) -> bool:
+    """Persist detected dims for future runs. Never raises."""
+    try:
+        if not _valid_dims(int(rows), int(cols)):
+            return False
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"rows": int(rows), "cols": int(cols),
+                                 "source": source,
+                                 "updated": datetime.now().isoformat()}) + "\n")
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def _valid_dims(rows: int, cols: int) -> bool:
     return 3 <= rows <= 6 and 2 <= cols <= 4
 
 
-def _blob_bbox(frame) -> tuple[int, int, int, int]:
-    """(left, top, width, height) of the board floor region.
-
-    The board sits on floor-colored tiles that form the largest closed floor
-    component in the lair band. Its width is exactly `cols*cell_px` and its
-    bottom edge is the board's bottom (the lair floor continues below it), so
-    cell_px and origin_y derive from it; the top is NOT reliable (the floor
-    extends upward around the Devourer).
-    """
+def _floor_components(frame) -> list[tuple[int, int, int, int, int]]:
+    """(left, top, width, height, area) of each floor-colored component in the
+    lair band, after morphological CLOSE (which bridges gaps between sprites
+    so the board floor is usually one solid component)."""
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, FLOOR_LOW, FLOOR_HIGH)
     x0, y0, x1, y1 = LAIR_BAND
@@ -121,11 +186,92 @@ def _blob_bbox(frame) -> tuple[int, int, int, int]:
     closed = cv2.morphologyEx(sub, cv2.MORPH_CLOSE,
                               np.ones((CLOSE_KERNEL, CLOSE_KERNEL), np.uint8))
     n, _lab, stats, _cents = cv2.connectedComponentsWithStats(closed)
-    if n < 2:
+    out = []
+    for i in range(1, n):
+        out.append((int(stats[i, cv2.CC_STAT_LEFT]),
+                    int(stats[i, cv2.CC_STAT_TOP]),
+                    int(stats[i, cv2.CC_STAT_WIDTH]),
+                    int(stats[i, cv2.CC_STAT_HEIGHT]),
+                    int(stats[i, cv2.CC_STAT_AREA])))
+    return out
+
+
+def _is_boardlike(comp, band_w, band_h) -> bool:
+    """True if a floor component could be the board floor (wide, short, and
+    its bottom edge sits low in the lair band)."""
+    _l, _t, w, h, _a = comp
+    if w < BLOB_MIN_BAND_FRAC * band_w:
+        return False
+    if h >= BLOB_MAX_ASPECT * w:
+        return False
+    _l, _t, _w, h, _a = comp
+    if (_t + h) < BLOB_MIN_BOTTOM_FRAC * band_h:
+        return False
+    return True
+
+
+def _blob_bbox(frame) -> tuple[int, int, int, int]:
+    """(left, top, width, height) of the board floor region.
+
+    The board sits on floor-colored tiles that form the target component in
+    the lair band. Its width is exactly `cols*cell_px` and its bottom edge is
+    the board's bottom (the lair floor continues below it), so cell_px and
+    origin_y derive from it; the top is NOT reliable (the floor extends upward
+    around the Devourer).
+
+    Robustness: of the floor-colored components, the board floor is the WIDEST
+    board-shaped (wide + short + low-bottom) one — a menu/dialog/station that
+    aliases floor color is narrower or taller, so preferring width among
+    board-like components beats blindly picking the largest-area component. If
+    no component looks board-like, fall back to the largest area (the old
+    behaviour) so a legitimate read is never lost.
+    """
+    comps = _floor_components(frame)
+    if not comps:
         raise NoFloorBlobError("no floor blob found in lair band")
-    i = max(range(1, n), key=lambda k: stats[k, cv2.CC_STAT_AREA])
-    return (int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP]),
-            int(stats[i, cv2.CC_STAT_WIDTH]), int(stats[i, cv2.CC_STAT_HEIGHT]))
+    bx, by, bw, bh = LAIR_BAND
+    band_w, band_h = bw - bx, bh - by
+    boardlike = [c for c in comps if _is_boardlike(c, band_w, band_h)]
+    if boardlike:
+        # Board floor is the widest board-shaped floor strip; ties to the
+        # one with the lowest (largest-y) bottom, which is the floor line.
+        best = max(boardlike,
+                   key=lambda c: (c[2], c[3]))  # (width, height) descending
+    else:
+        best = max(comps, key=lambda c: c[4])   # largest area (legacy)
+    return (best[0], best[1], best[2], best[3])
+
+
+def _detect_board_top_y(frame) -> int | None:
+    """y of the tile-grid's top edge, or None if no confident horizontal edge.
+
+    The board's top boundary is a strong, horizontally-extensive vertical
+    gradient band in the UPPER portion of the lair (below it the tiles begin,
+    above it the rock/Devourer area). Vertical sprite-internal edges are
+    suppressed by blur; a real board top is a long contiguous line. Measured
+    live: 5x4 board top ~1201. Returns the row with the longest such edge.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (0, 0), 3.0)
+    gy = cv2.Sobel(blur, cv2.CV_32F, 0, 1, ksize=3)
+    mag = np.abs(gy)
+    x0, y0, x1, y1 = LAIR_BAND
+    bx_lo, bx_hi = x0, x1
+    search_bot = y0 + int((y1 - y0) * TOP_EDGE_SEARCH_FRAC)
+    best_y, best_span = None, TOP_EDGE_MIN_SPAN
+    for yy in range(y0, search_bot):
+        cnt = int(np.count_nonzero(mag[yy:yy + 1, bx_lo:bx_hi] > TOP_EDGE_EDGE_THR))
+        if cnt > best_span:
+            best_y, best_span = yy, cnt
+    return best_y
+
+
+def _rows_fit(rows: int, cell_px: int, top_y: int, blob_bottom: int) -> float:
+    """Abs residual (in cells) between a candidate's implied height and the
+    measured board height. 0 is a perfect fit; a wrong row count is ~1 cell."""
+    implied = rows * cell_px
+    measured = blob_bottom - top_y
+    return abs(implied - measured) / cell_px
 
 
 def _derive_grid(frame, rows: int, cols: int, llm_cell_px: int) -> GridGeometry:
@@ -263,40 +409,59 @@ def _score_geometry(frame, geom: GridGeometry, classifier) -> float:
     return _objective(frame, geom, anchors, classifier)
 
 
-def llm_grid_geometry(frame, llm, classifier: TemplateClassifier | None = None,
-                      max_dim: int | None = MAX_DIM, log=print) -> GridGeometry:
-    """Read board geometry off `frame`: LLM dims as prior + blob pixels + refine.
+def llm_grid_geometry(frame, llm=None, classifier: TemplateClassifier | None = None,
+                      max_dim: int | None = MAX_DIM, log=print,
+                      prior_dims: tuple[int, int] | None = None) -> GridGeometry:
+    """Read board geometry off `frame`: dims prior + blob pixels + refine.
 
-    The floor blob derives exact pixel geometry from the dims; candidates near
-    the LLM's row/col count are each blob-derived, then the one whose grid best
-    aligns its occupied cells to the template bank wins. Raises if no candidate
-    is blob-plausible, so the caller can fall back to calibrated constants.
+    The dims prior is, in order: explicit `prior_dims` (the pinned config —
+    no LLM round at all), the LLM read, or nothing (enumerate ALL plausible
+    dims and let the anchored-template objective pick the winner). The floor
+    blob derives exact pixel geometry from the dims; candidates near the
+    prior row/col count are each blob-derived, then the one whose grid best
+    aligns its occupied cells to the template bank wins. Raises if no
+    candidate is blob-plausible, so the caller can fall back to calibrated
+    constants.
     """
-    image_url = _encode_frame(frame, max_dim=max_dim)
-    messages = [
-        {"role": "system", "content": GEOMETRY_SYSTEM_PROMPT},
-        {"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": image_url}},
-            {"type": "text", "text": "Output the board geometry JSON now."}]},
-        {"role": "assistant", "content": '{"rows":'},  # prefill forces clean JSON (vision reads)
-    ]
-    # The LLM dims are a PRIOR, not a requirement: text-only servers (e.g.
-    # Qwen3-4B-Instruct-2507) reject image requests outright, and --jinja
-    # servers echo prefills into garbled JSON. In those cases enumerate ALL
-    # plausible dims and let the anchored-template objective pick the winner.
+    # The dims are a PRIOR, not a requirement: the pinned config skips the
+    # LLM outright; text-only servers (e.g. Qwen3-4B-Instruct-2507) reject
+    # image requests outright, and --jinja servers echo prefills into
+    # garbled JSON. In those cases enumerate ALL plausible dims and let the
+    # anchored-template objective pick the winner.
     rows0 = cols0 = 0
     mx = my = 0
-    try:
-        reply, _full_msg = llm.chat(messages, max_tokens=128, json_mode=False)
-        data = _parse_json(reply)
-        rows0 = int(data.get("rows", 0))
-        cols0 = int(data.get("cols", 0))
-        mx, my = int(data.get("mouth_x", 0)), int(data.get("mouth_y", 0))
-        if not _valid_dims(rows0, cols0):
-            raise ValueError(f"implausible grid dims rows={rows0} cols={cols0}")
-    except (LLMError, ValueError, KeyError, TypeError) as exc:
-        log(f"  geometry: LLM prior unavailable ({exc}); enumerating all dims")
-        rows0 = cols0 = 0
+    if prior_dims is not None:
+        try:
+            rows0, cols0 = int(prior_dims[0]), int(prior_dims[1])
+        except (TypeError, ValueError, IndexError):
+            rows0 = cols0 = 0
+        if _valid_dims(rows0, cols0):
+            log(f"  geometry: pinned dims {rows0}x{cols0} (no LLM round)")
+        else:
+            log(f"  geometry: pinned dims {rows0}x{cols0} invalid; enumerating all dims")
+            rows0 = cols0 = 0
+    elif llm is None:
+        log("  geometry: no LLM and no pinned dims; enumerating all dims")
+    else:
+        image_url = _encode_frame(frame, max_dim=max_dim)
+        messages = [
+            {"role": "system", "content": GEOMETRY_SYSTEM_PROMPT},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": image_url}},
+                {"type": "text", "text": "Output the board geometry JSON now."}]},
+            {"role": "assistant", "content": '{"rows":'},  # prefill forces clean JSON (vision reads)
+        ]
+        try:
+            reply, _full_msg = llm.chat(messages, max_tokens=128, json_mode=False)
+            data = _parse_json(reply)
+            rows0 = int(data.get("rows", 0))
+            cols0 = int(data.get("cols", 0))
+            mx, my = int(data.get("mouth_x", 0)), int(data.get("mouth_y", 0))
+            if not _valid_dims(rows0, cols0):
+                raise ValueError(f"implausible grid dims rows={rows0} cols={cols0}")
+        except (LLMError, ValueError, KeyError, TypeError) as exc:
+            log(f"  geometry: LLM prior unavailable ({exc}); enumerating all dims")
+            rows0 = cols0 = 0
 
     candidates = []
     for rows, cols in _candidate_dims(rows0, cols0):
@@ -321,8 +486,30 @@ def llm_grid_geometry(frame, llm, classifier: TemplateClassifier | None = None,
         _r, _c, geom = candidates[0]
         log(f"  geometry: LLM prior {rows0}x{cols0} -> blob {geom}")
         return geom
-    best = max(candidates, key=lambda c: _score_geometry(frame, c[2], classifier))
-    _br, _bc, geom = best
+
+    # Row-count ambiguity: the blob's width fixes cell_px/cols precisely, but
+    # rows only shifts origin_y, and square-ish boards (4x4 vs 5x4) can give
+    # IDENTICAL template scores — a tie currently decided by the LLM's
+    # unreliable count. The board's measured HEIGHT (top edge -> floor line)
+    # resolves it: a candidate whose rows*cell_px matches that span is the true
+    # one. Prefer the best vertical fit; among candidates that fit about as
+    # well, fall back to the template objective to keep its anchor value.
+    top_y = _detect_board_top_y(frame)
+    _bx, _by, _bw, _bh = _blob_bbox(frame)
+    blob_bottom = _by + _bh
+    if top_y is None:
+        scored = [(*c, _score_geometry(frame, c[2], classifier)) for c in candidates]
+        best = max(scored, key=lambda c: c[3])
+    else:
+        scored = [(*c, _rows_fit(c[0], c[2].cell_px, top_y, blob_bottom),
+                   _score_geometry(frame, c[2], classifier))
+                  for c in candidates]
+        best_fit = min(scored, key=lambda c: c[3])
+        # Within the fit tolerance, the highest template score wins; otherwise
+        # a candidate that clearly fits the measured height wins outright.
+        in_tol = [c for c in scored if c[3] <= best_fit[3] + VERT_FIT_TOL]
+        best = max(in_tol, key=lambda c: c[4])
+    _br, _bc, geom = best[0], best[1], best[2]
     prior = f"{rows0}x{cols0}" if rows0 else "none"
     if (_br, _bc) != (rows0, cols0):
         log(f"  geometry: LLM prior {prior} overruled -> {_br}x{_bc} ({geom})")

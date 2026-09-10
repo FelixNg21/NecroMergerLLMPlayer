@@ -36,6 +36,7 @@ from vision.menu import read_item_popup
 POPUP_DISMISS = (120, 2350)      # dimmed corner: closes the popup
 SIGNATURE_DIR = "assets/signatures"
 SIGNATURE_THRESHOLD = 0.7
+SIGNATURE_MIN_STD = 15.0  # gray std below which a title crop is blank (see _save_signature)
 DIGIT_DIR = "assets/digits"
 DIGIT_THRESHOLD = 0.75
 IDENTIFY_PAUSE = 1.3             # seconds to let the popup animate in
@@ -161,6 +162,14 @@ def popup_question_for(name_hint: str) -> str:
     return ITEM_POPUP_QUESTION
 
 
+# Unlevelled eye components -> their leveled form (wiki Eye Monster page:
+# Eyeball and Eye in a Jar are level-less components; the Eye Monster has
+# Lvl 1-6). Used by `_resolve_id` and `_identify_one` so a trusted level
+# read overrides a lying title signature (Sep 6: banked `eyeball`
+# signature matched an "Eye Monster Lvl 1" title at 1.0).
+EYE_COMPONENTS = {"eyeball": "eyemonster", "eyeinajar": "eyemonster"}
+
+
 class Identifier:
     def __init__(self, device, classifier: TemplateClassifier,
                  signatures_dir: str = SIGNATURE_DIR,
@@ -248,12 +257,24 @@ class Identifier:
     def _save_signature(self, base_name: str, name_crop) -> None:
         if base_name in self.signatures:
             return
+        # Texture gate (mirrors the template bank's MIN_TEMPLATE_STD): a
+        # near-blank title crop (std 0.0 observed Sep 5: an empty panel bar
+        # banked as "be") matches every other blank title at ~1.0 and then
+        # wins every future read deterministically. Refuse to save those.
+        try:
+            import cv2 as _cv2
+            g = _cv2.cvtColor(name_crop, _cv2.COLOR_BGR2GRAY)
+            if float(g.std()) < SIGNATURE_MIN_STD:
+                return
+        except Exception:
+            return
         self.signatures_dir.mkdir(parents=True, exist_ok=True)
         path = self.signatures_dir / f"{base_name}.png"
         cv2.imwrite(str(path), name_crop)
         self.signatures[base_name] = name_crop
 
-    def _resolve_id(self, base_name: str, level: int | None, sprite) -> str:
+    def _resolve_id(self, base_name: str, level: int | None, sprite,
+                    level_trusted: bool = True) -> str:
         """Assemble id from (name, level); dedup + disambiguate sprite conflicts.
 
         The sprite is the ground truth for (name, level): if it already matches
@@ -272,19 +293,53 @@ class Identifier:
         canonical id — the model sees the popup, learns the right name, and
         the bank grows more permissive. If the popup also says a different
         level, the next UNID-popup-read (Option 3) catches it.
+
+        level_trusted gates the broadening: a weak single-source level
+        (low digit score, no LLM agreement — e.g. a lvl3 digit misread as
+        lvl2) must not widen the WRONG level's bank with this sprite
+        (observed Sep 5: a lvl3 coins sprite banked under coins_lvl2,
+        poisoning future lvl3 reads toward lvl2). Untrusted levels still
+        return their id (the caller decides), just without banking.
         """
         existing, score = self.classifier.match_existing(sprite)
         if existing is not None:
-            return existing
+            m = re.search(r"_lvl(\d+)$", existing)
+            existing_base = re.sub(r"__\d+$", "", existing).split("_lvl")[0]
+            conflict = (level is not None and level_trusted
+                        and ((m is not None and int(m.group(1)) != level)
+                             # Unlevelled-component match (e.g. eyeball) with
+                             # a trusted level: the match is the wrong form
+                             # (see EYE_COMPONENTS) — fall through and
+                             # assemble the canonical leveled id instead of
+                             # cementing the component label.
+                             or (existing_base in EYE_COMPONENTS
+                                 and level >= 1)))
+            # A confident level overrides a conflicting bank match. The bank
+            # can hold wrong-level sprites (observed Sep 5: lvl3 coins
+            # sprites broadened into coins_lvl2, then every lvl3 sprite
+            # "matched" coins_lvl2 while the digit read 3.0 — the merge kept
+            # no-oping). Reusing the match would cement the error; fall
+            # through and assemble the canonical id from the trusted level.
+            if not conflict:
+                return existing
         base_name = self._sanitize_id(base_name)
+        # Eye-family remap (Sep 6): see EYE_COMPONENTS. Applied here (not
+        # just in `_identify_one`) so every caller assembles the leveled
+        # form when a trusted level contradicts an unlevelled base.
+        if (base_name in EYE_COMPONENTS and level is not None
+                and level >= 1 and level_trusted):
+            base_name = EYE_COMPONENTS[base_name]
         item_id = f"{base_name}_lvl{level}" if level else base_name
-        # Always return the canonical id; add the sprite to its bank so the
-        # next classify_board run can match it. The match_existing check
-        # above already returns a true-positive banked id for sprites that
-        # already match; this branch is reached when the freshly-derived
-        # id conflicts with a different sprite, and broadening the
-        # canonical bank is safer than minting a __alt.
-        if self.classifier.has(item_id):
+        # Broaden the canonical bank so the next classify_board run can
+        # match this sprite — but ONLY for already-banked ids with a
+        # trusted level. The match_existing check above already returns a
+        # true-positive banked id for sprites that already match; this
+        # branch is reached on conflict, and blindly banking here minted
+        # garbage ids (Sep 5: "be_lvl2" from an OCR fragment) and widened
+        # the WRONG level (a lvl3 sprite under coins_lvl2 from a weak
+        # digit read). Unknown ids are returned unbanked — deliberate
+        # discovery paths (proactive UNID identify) bank new items.
+        if level_trusted and self.classifier.has(item_id):
             self.classifier.add_template(item_id, sprite)
         return item_id
 
@@ -391,6 +446,47 @@ class Identifier:
         bright = float((top > 200).mean())
         return bright < 0.002
 
+    @staticmethod
+    def _sig_disputed(sig_hit: str, llm_hit: str, ocr_hit: str) -> bool:
+        """Two-against-one vote to distrust a title-signature match.
+
+        True only when the LLM body name AND the OCR name both differ
+        from the signature hit (all sanitized). Single-signal
+        disagreements — OCR-only mangling like "tonbie" for zombie, or
+        an LLM-only misread — keep the conservative signature label.
+        """
+        return bool(llm_hit and llm_hit != sig_hit
+                    and ocr_hit and ocr_hit != sig_hit)
+
+    def _confirm_overrule(self, cell, expect_name: str):
+        """Re-tap + re-read to confirm a signature overrule.
+
+        Returns (body, ocr_name, ocr_level, popup) from the second frame
+        when its LLM body name sanitizes to `expect_name` — two independent
+        popup reads agreeing outweighs one title-signature match — else
+        None (keep the conservative signature label). Bounded to a single
+        extra tap + one LLM body read; failures return None, never raise.
+        """
+        try:
+            self.device.tap(cell.cx, cell.cy)
+            self.device.wait_for_idle(IDENTIFY_PAUSE)
+            self.device.screencap()
+            popup2 = cv2.imread(str(self.device.screencap_path))
+            if popup2 is None or self._panel_placeholder_text(popup2):
+                return None
+            ocr_name2, ocr_level2 = ocr.extract_item_info(popup2)
+            if self.llm is None:
+                return None
+            body2 = read_item_popup(
+                popup2, self.llm,
+                question=popup_question_for(expect_name or ""))
+            name2 = self._sanitize_id(str((body2 or {}).get("name") or ""))
+            if not name2 or name2 != expect_name:
+                return None
+            return body2, ocr_name2, ocr_level2, popup2
+        except Exception:
+            return None
+
     def read_recipe(self, board_frame, cell) -> dict:
         """Popup-read the info body (description + merge chain) for an item the
         classifier already knows, without re-identifying or re-banking its
@@ -457,6 +553,7 @@ class Identifier:
         level: int | None = None
         ocr_name = ""
         ocr_level = None
+        overruled_from: str | None = None
         sig_score = 0.0
         digit_score = 0.0
         for attempt in range(READ_RETRIES):
@@ -508,6 +605,32 @@ class Identifier:
                 if self.llm is not None and not body:
                     question = popup_question_for(base_name or "")
                     body = read_item_popup(popup, self.llm, question=question)
+                # Cross-signal vote (Sep 6): a banked title signature can
+                # lie — observed live, `eyeball` matched an "Eye Monster
+                # Lvl 1" title at 1.0 while OCR read "fuemonster" and the
+                # digit read 1 @1.0. Overrule the signature only on
+                # two-against-one (LLM body name AND OCR name both differ
+                # from it), then re-tap once and require the second read
+                # to confirm. Single-signal disagreements (OCR-only
+                # mangling like "tonbie") keep the conservative label.
+                if self.llm is not None and body:
+                    sig_hit = self._sanitize_id(base_name or "")
+                    llm_hit = self._sanitize_id(str(body.get("name") or ""))
+                    # The body level feeds the digit fallback below (and the
+                    # LLM-agreement trust clause) even when the signature
+                    # name stands — same semantics as the unknown branch.
+                    llm_level = self._coerce(body.get("level"))
+                    ocr_hit = self._sanitize_id(ocr_name or "")
+                    if (self._sig_disputed(sig_hit, llm_hit, ocr_hit)):
+                        confirmed = self._confirm_overrule(cell, llm_hit)
+                        if confirmed is not None:
+                            body2, ocr_name2, ocr_level2, popup2 = confirmed
+                            overruled_from = sig_hit
+                            base_name = llm_hit
+                            body, ocr_name = body2, ocr_name2
+                            llm_level = self._coerce(
+                                (body2 or {}).get("level"))
+                            popup = popup2
             level, digit_score = self._match_digit(ocr.glyph_crop(popup))
             if level is None:
                 level = llm_level or ocr_level
@@ -534,8 +657,22 @@ class Identifier:
             return item_id, {"name": "unknown", "level": None, "error": "panel_did_not_populate"}
 
         sprite = crop_cell(board_frame, cell.row, cell.col)
-        item_id = self._resolve_id(base_name, level, sprite)
-        self.classifier.add_template(item_id, sprite)
+        # Level trust: a confident digit read, or LLM/OCR agreement. A weak
+        # single-source level must not widen any bank (see _resolve_id).
+        level_trusted = (
+            digit_score >= DIGIT_THRESHOLD
+            or (llm_level is not None and level is not None
+                and llm_level == level))
+        # Eye-family level override (Sep 6): see EYE_COMPONENTS. Mirrors the
+        # `_resolve_id` conflict fall-through so the returned info name is
+        # the leveled form too.
+        if (base_name in EYE_COMPONENTS and level is not None
+                and level >= 1 and level_trusted):
+            base_name = EYE_COMPONENTS[base_name]
+        item_id = self._resolve_id(base_name, level, sprite,
+                                   level_trusted=level_trusted)
+        if self.classifier.has(item_id):
+            self.classifier.add_template(item_id, sprite)
 
         # dismiss the panel only if it actually populated.
         # Tapping POPUP_DISMISS on a still-placeholder panel would be
@@ -553,6 +690,8 @@ class Identifier:
                 "merge_info": body.get("merge_info") or "",
                 "feed_value": self._coerce(body.get("feed_value")),
                 "damage": self._coerce(body.get("damage"))}
+        if overruled_from:
+            info["overruled"] = f"{overruled_from}->{base_name}"
         return item_id, info
 
     def identify_batch(self, board_frame, cells: list) -> list[tuple[str, dict]]:

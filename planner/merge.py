@@ -23,7 +23,7 @@ Scoring is a deterministic sort key (higher = better):
 import re
 from collections import defaultdict
 
-from planner.constants import CHAMPION_PREFIXES, MERGE_MIN_MARGIN, item_name_matches
+from planner.constants import CHAMPION_PREFIXES, MERGE_MIN_MARGIN, craved_matches, item_name_matches
 
 _LEVEL_RE = re.compile(r"_lvl(\d+)$")
 
@@ -158,8 +158,30 @@ def score_merge(item_id: str, cells, *, max_level_ids=None, chain_map=None,
     return (max_bonus, lookahead, -craved, lvl, -r, -c)
 
 
+def destroys_craving(item_id: str, n_cells: int, *, craved_item: str | None,
+                      craved_level: int | None,
+                      craved_need: int | None) -> bool:
+    """True when merging a pair of `item_id` would destroy needed craving material.
+
+    Fires only on full knowledge: the merged id is the EXACT craved id at the
+    craved level (`craved_level` from the menu read — never the degraded
+    bubble-only match) and the surviving at-level count (`n_cells - 2`) falls
+    below the remaining need. Merges that BUILD the craving (precursor ids)
+    and merges from a surplus (`n_cells - 2 >= need`) are unaffected.
+    """
+    if not item_id or not craved_item or craved_level is None:
+        return False
+    if craved_need is None or craved_need <= 0:
+        return False
+    if not craved_matches(item_id, craved_item, craving_level=craved_level):
+        return False
+    return (n_cells - 2) < craved_need
+
+
 def ranked_merge_groups(board, *, max_level_ids=None, chain_map=None,
                         craved_item: str | None = None,
+                        craved_level: int | None = None,
+                        craved_need: int | None = None,
                         exclude_pairs: set | None = None):
     """All mergeable identical-item groups on the board, best-first.
 
@@ -168,6 +190,9 @@ def ranked_merge_groups(board, *, max_level_ids=None, chain_map=None,
     `exclude_pairs` = set of ((r,c),(r,c)) pairs to never propose (merge_noop
     backoff): the best non-excluded adjacent pair is chosen per group, and a
     group with no non-excluded pair is dropped entirely.
+    Groups that would destroy needed craving material (see
+    `destroys_craving`) are dropped too — merging the last two craved
+    monsters into the next level starves the craving.
     """
     max_level = set(max_level_ids or ())
     exclude = {(tuple(a), tuple(b)) for a, b in (exclude_pairs or ())}
@@ -181,6 +206,12 @@ def ranked_merge_groups(board, *, max_level_ids=None, chain_map=None,
     for item_id, cells in groups.items():
         confident = [c for c in cells if c.margin >= MERGE_MIN_MARGIN]
         confident.sort(key=lambda c: (c.row, c.col))
+        # Count ALL cells of this id (not just confident ones): an
+        # unconfident cell can't merge but is still a feedable craving
+        # candidate, so it counts toward the surviving material.
+        if destroys_craving(item_id, len(cells), craved_item=craved_item,
+                             craved_level=craved_level, craved_need=craved_need):
+            continue
         pair = None
         for i in range(len(confident) - 1):
             cand = (confident[i], confident[i + 1])

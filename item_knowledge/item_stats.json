@@ -1,66 +1,87 @@
 {
   "bone": {
-    "feed": 1,
+    "feed": 2,
     "damage": null,
     "max_level": false,
     "source": "popup",
-    "updated": "2026-08-31T13:22:26.334576"
+    "updated": "2026-09-07T18:32:18.028183"
   },
   "ribcage": {
     "feed": 2,
     "damage": null,
     "max_level": false,
     "source": "popup",
-    "updated": "2026-08-31T13:22:26.334599"
+    "updated": "2026-09-05T19:23:07.926890"
   },
   "skeleton_lvl4": {
     "feed": 140,
     "damage": 50,
     "max_level": false,
     "source": "popup",
-    "updated": "2026-09-01T11:06:48.377753"
+    "updated": "2026-09-07T20:10:45.793608",
+    "makes": {
+      "mana": 5
+    }
   },
   "skeleton_lvl5": {
-    "feed": 700,
-    "damage": 225,
+    "feed": 300,
+    "damage": 100,
     "max_level": false,
     "source": "popup",
-    "updated": "2026-08-31T13:22:26.334622"
+    "updated": "2026-09-07T20:10:45.793608",
+    "makes": {
+      "mana": 7
+    }
   },
   "skeleton_lvl6": {
     "feed": 300,
     "damage": 100,
     "max_level": false,
     "source": "popup",
-    "updated": "2026-08-31T19:54:37.375854"
+    "updated": "2026-09-07T20:10:45.793608",
+    "makes": {
+      "mana": 10
+    }
   },
   "zombie_lvl2": {
     "feed": 60,
     "damage": 25,
     "max_level": false,
     "source": "popup",
-    "updated": "2026-08-31T13:22:26.334638"
+    "updated": "2026-09-07T20:10:45.793608",
+    "makes": {
+      "slime": 2
+    }
   },
   "skeleton_lvl1": {
     "feed": 10,
     "damage": 5,
     "max_level": false,
     "source": "popup",
-    "updated": "2026-08-31T13:22:26.334646"
+    "updated": "2026-09-07T20:10:45.793608",
+    "makes": {
+      "mana": 1
+    }
   },
   "skeleton_lvl2": {
     "feed": 25,
     "damage": 10,
     "max_level": false,
     "source": "popup",
-    "updated": "2026-09-02T17:12:01.049597"
+    "updated": "2026-09-07T20:10:45.793608",
+    "makes": {
+      "mana": 2
+    }
   },
   "skeleton_lvl3": {
-    "feed": 60,
+    "feed": 2,
     "damage": 25,
     "max_level": false,
     "source": "popup",
-    "updated": "2026-09-02T19:39:02.729889"
+    "updated": "2026-09-07T20:10:45.793608",
+    "makes": {
+      "mana": 3
+    }
   },
   "icerune_lvl3": {
     "feed": 12,
@@ -88,7 +109,7 @@
     "damage": null,
     "max_level": false,
     "source": "popup",
-    "updated": "2026-08-31T13:22:26.334825"
+    "updated": "2026-09-05T15:47:11.746643"
   },
   "coins_lvl1": {
     "feed": 2,
@@ -102,7 +123,7 @@
     "damage": null,
     "max_level": false,
     "source": "popup",
-    "updated": "2026-08-31T13:22:26.334841"
+    "updated": "2026-09-07T18:39:44.866068"
   },
   "poisonrune_lvl2": {
     "feed": 12,
@@ -123,7 +144,10 @@
     "damage": 500,
     "max_level": true,
     "source": "popup",
-    "updated": "2026-08-31T13:22:26.334983"
+    "updated": "2026-09-07T20:10:45.793608",
+    "makes": {
+      "mana": 14
+    }
   },
   "skeleton": {
     "feed": 60,
@@ -144,7 +168,7 @@
     "damage": null,
     "max_level": false,
     "source": "popup",
-    "updated": "2026-08-31T13:22:26.335001"
+    "updated": "2026-09-03T19:14:18.737119"
   },
   "manapot_lvl3": {
     "feed": 22,
@@ -154,11 +178,11 @@
     "updated": "2026-08-31T13:22:26.335012"
   },
   "necromancer": {
-    "feed": 700,
-    "damage": 225,
+    "feed": 60,
+    "damage": 25,
     "max_level": false,
     "source": "popup",
-    "updated": "2026-08-31T13:22:26.335018"
+    "updated": "2026-09-05T23:13:05.185649"
   },
   "icerunes": {
     "feed": 5,
@@ -172,34 +196,265 @@
     "damage": null,
     "max_level": false,
     "source": "popup",
-    "updated": "2026-08-31T13:22:26.335041"
+    "updated": "2026-09-05T19:51:38.054652"
   },
   "severedhand": {
-    "feed": 2,
+    "feed": 1,
     "damage": null,
     "max_level": false,
     "source": "popup",
-    "updated": "2026-08-31T13:22:26.335051"
+    "updated": "2026-09-03T22:42:08.923595"
   },
   "zombie_lvl1": {
     "feed": 30,
     "damage": 10,
     "max_level": false,
     "source": "popup",
-    "updated": "2026-08-31T20:08:10.412702"
+    "updated": "2026-09-07T20:10:45.793608",
+    "makes": {
+      "slime": 1
+    }
   },
   "peasant": {
-    "feed": 50,
+    "feed": 1,
     "damage": null,
     "max_level": false,
     "source": "popup",
-    "updated": "2026-09-02T19:23:03.293010"
+    "updated": "2026-09-03T19:14:18.736373"
   },
   "gems_lvl1": {
     "feed": 2,
     "damage": null,
     "max_level": false,
     "source": "popup",
-    "updated": "2026-09-02T19:43:12.008904"
+    "updated": "2026-09-03T20:22:04.797853"
+  },
+  "zombie_lvl3": {
+    "feed": 175,
+    "damage": 50,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-09-07T20:10:45.793608",
+    "makes": {
+      "slime": 4
+    }
+  },
+  "manapool_lvl1": {
+    "feed": 60,
+    "damage": 25,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-09-04T04:34:50.221400"
+  },
+  "icerunes_lvl1": {
+    "feed": 2,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-09-04T04:39:28.274669"
+  },
+  "poisonrunes_lvl1": {
+    "feed": 2,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-09-04T04:40:44.041457"
+  },
+  "zombie_lvl4": {
+    "feed": 400,
+    "damage": 125,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-09-07T20:10:45.793608",
+    "makes": {
+      "slime": 6
+    }
+  },
+  "coins_lvl4": {
+    "feed": 30,
+    "damage": null,
+    "max_level": true,
+    "source": "wiki",
+    "updated": "2026-09-05T15:10:27.904838"
+  },
+  "bloodrune_lvl2": {
+    "feed": 5,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-09-05T19:07:16.130811"
+  },
+  "eyeball": {
+    "feed": 1,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-09-07T17:14:03.308861"
+  },
+  "eyeinajar": {
+    "feed": 2,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-09-06T03:09:07.709719"
+  },
+  "zombie_lvl5": {
+    "feed": 1000,
+    "damage": 300,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-09-07T20:10:45.793608",
+    "makes": {
+      "slime": 9
+    }
+  },
+  "eyemonster_lvl1": {
+    "feed": 15,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-09-07T20:10:45.793608",
+    "makes": {
+      "mana": 2
+    }
+  },
+  "eyemonster_lvl2": {
+    "feed": 35,
+    "damage": null,
+    "max_level": false,
+    "source": "wiki",
+    "updated": "2026-09-07T20:10:45.793608",
+    "makes": {
+      "mana": 4
+    }
+  },
+  "eyemonster_lvl3": {
+    "feed": 80,
+    "damage": null,
+    "max_level": false,
+    "source": "popup",
+    "updated": "2026-09-07T20:10:45.793608",
+    "makes": {
+      "mana": 6
+    }
+  },
+  "eyemonster_lvl4": {
+    "makes": {
+      "mana": 9
+    },
+    "source": "wiki",
+    "updated": "2026-09-07T20:10:45.793608"
+  },
+  "eyemonster_lvl5": {
+    "makes": {
+      "mana": 12
+    },
+    "source": "wiki",
+    "updated": "2026-09-07T20:10:45.793608"
+  },
+  "eyemonster_lvl6": {
+    "makes": {
+      "mana": 15
+    },
+    "source": "wiki",
+    "updated": "2026-09-07T20:10:45.793608"
+  },
+  "zombie_lvl6": {
+    "makes": {
+      "slime": 12
+    },
+    "source": "wiki",
+    "updated": "2026-09-07T20:10:45.793608"
+  },
+  "mummy_lvl1": {
+    "makes": {
+      "darkness": 1
+    },
+    "source": "wiki",
+    "updated": "2026-09-07T20:17:02.218519"
+  },
+  "mummy_lvl2": {
+    "makes": {
+      "darkness": 2
+    },
+    "source": "wiki",
+    "updated": "2026-09-07T20:17:02.218519"
+  },
+  "mummy_lvl3": {
+    "makes": {
+      "darkness": 3
+    },
+    "source": "wiki",
+    "updated": "2026-09-07T20:17:02.218519"
+  },
+  "mummy_lvl4": {
+    "makes": {
+      "darkness": 4
+    },
+    "source": "wiki",
+    "updated": "2026-09-07T20:17:02.218519"
+  },
+  "mummy_lvl5": {
+    "makes": {
+      "darkness": 6
+    },
+    "source": "wiki",
+    "updated": "2026-09-07T20:17:02.218519"
+  },
+  "bat_lvl1": {
+    "makes": {
+      "darkness": 2
+    },
+    "source": "wiki",
+    "updated": "2026-09-07T20:17:02.218519"
+  },
+  "bat_lvl2": {
+    "makes": {
+      "darkness": 4
+    },
+    "source": "wiki",
+    "updated": "2026-09-07T20:17:02.218519"
+  },
+  "bat_lvl3": {
+    "makes": {
+      "darkness": 6
+    },
+    "source": "wiki",
+    "updated": "2026-09-07T20:17:02.218519"
+  },
+  "bat_lvl4": {
+    "makes": {
+      "darkness": 8
+    },
+    "source": "wiki",
+    "updated": "2026-09-07T20:17:02.218519"
+  },
+  "imp_lvl1": {
+    "makes": {
+      "darkness": 3
+    },
+    "source": "wiki",
+    "updated": "2026-09-07T20:17:02.218519"
+  },
+  "imp_lvl2": {
+    "makes": {
+      "darkness": 5
+    },
+    "source": "wiki",
+    "updated": "2026-09-07T20:17:02.218519"
+  },
+  "imp_lvl3": {
+    "makes": {
+      "darkness": 7
+    },
+    "source": "wiki",
+    "updated": "2026-09-07T20:17:02.218519"
+  },
+  "imp_lvl4": {
+    "makes": {
+      "darkness": 10
+    },
+    "source": "wiki",
+    "updated": "2026-09-07T20:17:02.218519"
   }
 }

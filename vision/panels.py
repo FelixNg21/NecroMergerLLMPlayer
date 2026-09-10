@@ -27,6 +27,7 @@ import json
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import cv2
@@ -130,8 +131,8 @@ class PanelReader:
     # a saturated-red circle ~30-40 px wide that overlaps the button's
     # top-right corner. A wider ROI catches red icon bleed (e.g. Own
     # Grave's red hourglass); a too-tight ROI misses small badges.
-    REWARD_BADGE_R_PIXELS = 60
-    REWARD_BADGE_ROI = (0.70, 0.0, 1.0, 0.25)   # (x0, y0, x1, y1) relative
+    REWARD_BADGE_R_PIXELS = 35
+    REWARD_BADGE_ROI = (0.65, 0.0, 1.0, 0.30)   # (x0, y0, x1, y1) relative — widened for bottom-row clipping
 
     def _has_claim_badge(self, button_crop) -> bool:
         """True when the green reward button has the red exclamation badge
@@ -328,10 +329,21 @@ class PanelReader:
         not depend on button/feat count matching (the LLM may report 4
         feats while the panel shows 3 green buttons because the 4th is
         already-collected).
+
+        ALL-DONE SHORT-CIRCUIT (Sep 4): the badge design is not stable
+        across rows — the bottom-row claim button renders with NO corner
+        badge (verified live: 4/4 feats Done, single green "Reward" button
+        at (949,2285), zero red px in the badge ROI, only red label text
+        inside the button). But preview buttons can only exist for
+        IN-PROGRESS feats, so when every cached feat is done, every green
+        button is a claim by elimination — no badge needed. This is airtight
+        (it cannot misfire on a preview) and covers exactly the stuck case.
         """
         feats = feats or []
         if not centers:
             return []
+        if feats and all(bool(f.get("done")) for f in feats):
+            return list(centers)
         if not feats or len(centers) == len(feats):
             # Pairing logic preserved for backward compat: if the LLM
             # read is well-formed, prefer the done-flag mapping. The
@@ -673,6 +685,16 @@ CURRENCY_SLOTS = [  # (x0, x1, rune name) left-to-right; count digits right-alig
 CARD_Y = (2180, 2621)          # station-card row (bottom sheet)
 CARD_XS = [(19, 439), (480, 954), (892, 1280)]   # up to 3 visible cards
 CARD_TAP_Y = 2400              # vertical center of a card
+# Card-row paging: the sheet is scrollable left-right and only 3 cards are
+# visible — later stations (Supply Cupboard, Fridge, ...) live off-screen.
+# Swipe left across the card row to reveal later cards; swipe right to
+# restore. Duration 500ms (merge-drag tuning: faster swipes no-op).
+CARD_SWIPE_LEFT = (1000, 300)  # (x_from, x_to) drag to page left
+CARD_SWIPE_Y = CARD_TAP_Y
+CARD_SWIPE_MS = 500
+CARD_SWIPE_SETTLE = 0.8
+MAX_CARD_PAGES = 8             # pages scanned (covers 17 stations at ~3/page)
+CARD_RESCAN_SECONDS = 300      # re-scan for a previously-missing card at most this often
 # The REAL "Build?" dialog (Aug 24 live capture, assets/calib/feats/
 # buy_dialog_full.png): centered box y~987-1638 with the station name + cost,
 # and Cancel/Confirm buttons at y~1748-1899. The old Aug 7 model-sourced
@@ -730,13 +752,37 @@ BUY_QUESTION = ('This is a station-purchase card from the NecroMerger Station pa
                 '"locked". The 5 currencies are ice, poison, blood, moon, death.')
 
 # LLM card names -> canonical families (the vision model describes icons
-# loosely: "Blue orb" for the Manapool, etc.)
+# loosely: "Blue orb" for the Manapool, etc.). Covers ALL buyable stations:
+# off-screen cards (Supply Cupboard, Fridge, ...) are only reachable via
+# card-row swiping, and without an alias the family lookup misses ("supply
+# cupboard" != "supplycupboard") so the card is never found.
 FAMILY_ALIASES = {
     "grave": "grave", "cross": "grave", "tombstone": "grave",
     "manapool": "manapool", "pool": "manapool", "mana": "manapool",
     "orb": "manapool", "pond": "manapool",
     "manapot": "manapot", "flask": "manapot", "potion": "manapot",
     "lectern": "lectern", "desk": "lectern",
+    "supplycupboard": "supplycupboard", "supply cupboard": "supplycupboard",
+    "cupboard": "supplycupboard",
+    "fridge": "fridge", "refrigerator": "fridge",
+    "foulchicken": "foulchicken", "foul chicken": "foulchicken",
+    "chicken": "foulchicken",
+    "slimevat": "slimevat", "slime vat": "slimevat", "vat": "slimevat",
+    "slime": "slimevat",
+    "altar": "altar",
+    "darkstores": "darkstores", "dark stores": "darkstores",
+    "stores": "darkstores",
+    "portal": "portal",
+    "crashedsaucer": "crashedsaucer", "crashed saucer": "crashedsaucer",
+    "saucer": "crashedsaucer",
+    "telepad": "telepad",
+    "soulgrinder": "soulgrinder", "soul grinder": "soulgrinder",
+    "grinder": "soulgrinder",
+    "prism": "prism",
+    "meteor": "meteor",
+    "throne": "throne",
+    "unexpectedparcel": "unexpectedparcel", "unexpected parcel": "unexpectedparcel",
+    "parcel": "unexpectedparcel",
 }
 
 
@@ -794,6 +840,22 @@ class StationShop:
         # Initialized to None so reads BEFORE the first buy don't AttributeError
         # when the planner proxies via self.shop._pending_buy.
         self._pending_buy = None
+        # family -> card-row page index where the card was last seen (skips
+        # re-scanning on repeat buys; the sheet is scrollable and only 3
+        # cards are visible at once).
+        self._card_pages = {}
+        # unlock-requirement texts seen on grayed locked cards during the
+        # latest scan (e.g. "Tier 5 Feats Requires"). Rebuilt per _find_card
+        # scan; lets the planner distinguish "not on sheet" from "locked"
+        # and steer toward the unlock instead of rescanning forever.
+        self.locked_requirements = []
+        # family -> epoch seconds of the last FULL scan that missed it. A
+        # locked/unreleased station (e.g. Supply Cupboard before its
+        # Devourer level) would otherwise make every buy compel re-scan the
+        # whole sheet each step. The planner throttles re-scans against
+        # CARD_RESCAN_SECONDS (unlocks only happen on level-ups, so a
+        # re-check every few minutes is plenty).
+        self._card_missing = {}
 
     # ---- currency HUD ------------------------------------------------------
 
@@ -849,6 +911,100 @@ class StationShop:
         x0, x1 = CARD_XS[idx]
         return frame[CARD_Y[0]:CARD_Y[1], x0:x1]
 
+    @staticmethod
+    def _card_signature(cards: list[dict]) -> tuple:
+        """Order-sensitive page fingerprint for end-of-list detection."""
+        return tuple(c.get("station") for c in cards)
+
+    def _swipe_cards(self, left: bool = True):
+        """Page the card row one step (left reveals later stations)."""
+        x0, x1 = CARD_SWIPE_LEFT if left else (CARD_SWIPE_LEFT[1], CARD_SWIPE_LEFT[0])
+        self.device.swipe(x0, CARD_SWIPE_Y, x1, CARD_SWIPE_Y,
+                          duration_ms=CARD_SWIPE_MS)
+        self.device.wait_for_idle(CARD_SWIPE_SETTLE)
+        self.device.screencap()
+        return cv2.imread(str(self.device.screencap_path))
+
+    def _find_card(self, frame, family: str) -> tuple[dict | None, object, int, list]:
+        """Locate `family`'s card, paging left as needed.
+
+        Returns (card_or_None, latest_frame, pages_advanced, last_page_cards).
+        Starts from the cached page when known (skips re-reads), otherwise
+        scans from the current position. Stops at the first page whose
+        signature repeats (end of list) or MAX_CARD_PAGES. Every scanned
+        page runs read_cards, so cost_cache accumulates across pages as a
+        side effect. Callers must restore the scroll (swipe right
+        pages_advanced times) before closing so the next buy starts from a
+        known position.
+        """
+        pages = 0
+        last_cards: list = []
+        self.locked_requirements = []
+        jump = self._card_pages.get(family, 0)
+        for _ in range(jump):
+            frame = self._swipe_cards(left=True)
+            if frame is None:
+                return None, frame, pages, last_cards
+            pages += 1
+        prev_sig = None
+        for _ in range(MAX_CARD_PAGES):
+            cards = self.read_cards(frame)
+            last_cards = cards
+            for c in cards:
+                if c.get("station") == "locked" and c.get("requires"):
+                    if c["requires"] not in self.locked_requirements:
+                        self.locked_requirements.append(c["requires"])
+            sig = self._card_signature(cards)
+            card = next((c for c in cards if c["station"] == family), None)
+            if card is not None:
+                self._card_pages[family] = pages
+                self._card_missing.pop(family, None)
+                return card, frame, pages, last_cards
+            if sig == prev_sig:
+                break  # end of list (swipe no-ops at the edge)
+            prev_sig = sig
+            frame = self._swipe_cards(left=True)
+            if frame is None:
+                return None, frame, pages, last_cards
+            pages += 1
+        self._card_missing[family] = time.time()
+        return None, frame, pages, last_cards
+
+    def _restore_scroll(self, pages: int) -> None:
+        """Swipe back to the pre-search position before closing the panel."""
+        for _ in range(max(0, pages)):
+            self._swipe_cards(left=False)
+
+    @staticmethod
+    def _card_row_hash(frame) -> int | None:
+        """Cheap card-row fingerprint for scroll-end detection (no LLM)."""
+        try:
+            row = frame[CARD_Y[0]:CARD_Y[1], :]
+            small = cv2.resize(row, (160, 27), interpolation=cv2.INTER_AREA)
+            return hash(small.tobytes())
+        except Exception:
+            return None
+
+    def _rewind_to_start(self) -> None:
+        """Swipe right until the sheet stops moving (true first page).
+
+        One-shot recovery for a sheet left mid-list by a flow that bypassed
+        buy() (all buy() exits restore scroll, so the steady state starts
+        leftmost). NOT called per-buy: it costs swipes + screencaps that
+        would shift scripted test frames and slow every purchase.
+        """
+        prev = None
+        for _ in range(3):
+            self.device.screencap()
+            frame = cv2.imread(str(self.device.screencap_path))
+            if frame is None:
+                return
+            sig = self._card_row_hash(frame)
+            if sig is not None and sig == prev:
+                return
+            prev = sig
+            self._swipe_cards(left=False)
+
     def _llm_card(self, frame, idx: int) -> dict | None:
         crop = self._card_crop(frame, idx)
         ok, buf = cv2.imencode(".jpg", crop)
@@ -899,8 +1055,20 @@ class StationShop:
                 info["station"] = normalize_station_name(
                     str(data.get("station") or "unknown"))
             for k in ("cost_ice", "cost_poison", "cost_blood",
-                      "cost_moon", "cost_death"):
+                       "cost_moon", "cost_death"):
                 info[k] = int(data.get(k) or 0)
+            if info["station"] in ("locked", "unknown"):
+                # Grayed locked card: read its unlock requirement ("Tier 5
+                # Feats Requires...") so the planner knows WHY a family is
+                # missing and what unlocks it, instead of rescanning
+                # forever. Also repairs "unknown": a card whose icon the
+                # bank/LLM both miss but whose text names a requirement is
+                # a locked card, not an unidentified buyable one.
+                info["requires"] = self._ocr_card_requirement(crop)
+                if (info["station"] == "unknown" and info["requires"]
+                        and re.search(r"requir|locked|tier \d|level \d",
+                                      info["requires"], re.I)):
+                    info["station"] = "locked"
             if info["station"] not in ("unknown", "empty", "locked"):
                 self.cost_cache[info["station"]] = {
                     "ice": info["cost_ice"],
@@ -911,6 +1079,20 @@ class StationShop:
                 }
             cards.append(info)
         return cards
+
+    @staticmethod
+    def _ocr_card_requirement(crop) -> str:
+        """Unlock-requirement text off a grayed locked card (best effort)."""
+        try:
+            g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            big = cv2.resize(g, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as t:
+                cv2.imwrite(t.name, big)
+                txt = apple_vision_text(t.name)
+                Path(t.name).unlink(missing_ok=True)
+            return " ".join((txt or "").split())[:120]
+        except Exception:
+            return ""
 
     # card icon regions (x-offset within the card, y-band) + the station
     # sprite templates they are matched against (multi-scale)
@@ -944,7 +1126,8 @@ class StationShop:
             base = Path(__file__).resolve().parent.parent / "assets" / "templates"
             for fam, fname in (("grave", "grave_lvl1__0.png"),
                                ("manapool", "manapool_lvl1__0.png"),
-                               ("manapot", "manapot_lvl1.png")):
+                               ("manapot", "manapot_lvl1.png"),
+                               ("supplycupboard", "supplycupboard_lvl1__0.png")):
                 p = base / fname
                 img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
                 if img is not None:
@@ -1238,6 +1421,15 @@ class StationShop:
         llm_read = self._llm_dialog(dialog_frame)
         if not llm_read:
             return None
+        # Station-name OCR override: the LLM repeatedly misnames the dialog
+        # station ("lectern"/"grave" for a Supply Cupboard dialog, observed
+        # live), which trips the exact-match dialog guard and aborts real
+        # buys. The dialog title OCR ("Supply Cupboard ... Lvl1 ... -20")
+        # matched against the fixed station vocabulary is authoritative.
+        ocr_fam = self._dialog_station_ocr(dialog_frame)
+        if ocr_fam and normalize_station_name(str(llm_read.get("station") or "")) != ocr_fam:
+            llm_read["station"] = ocr_fam
+            llm_read["station_ocr_override"] = True
         icons = self._rune_icon_locate(dialog_frame)
         if icons:
             corrected, was_overridden = self._apply_icon_guard(
@@ -1251,6 +1443,32 @@ class StationShop:
             llm_read["cost_text_sufficient"] = (
                 bool(sufficients) and all(sufficients)) if sufficients else None
         return llm_read
+
+    def _dialog_station_ocr(self, dialog_frame) -> str | None:
+        """Station family from the dialog title via OCR (vocabulary-matched).
+
+        Returns the canonical family when the title text contains a known
+        station name, else None. Never invents: unknown text yields None
+        and the LLM read stands.
+        """
+        try:
+            x, y, w, h = DIALOG_REGION
+            box = dialog_frame[y:y + h, x:x + w]
+            g = cv2.cvtColor(box, cv2.COLOR_BGR2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(g)
+            big = cv2.resize(clahe, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as t:
+                cv2.imwrite(t.name, big)
+                txt = apple_vision_text(t.name)
+                Path(t.name).unlink(missing_ok=True)
+            low = re.sub(r"[^a-z ]", "", (txt or "").lower())
+            low = " " + re.sub(r"\s+", " ", low).strip() + " "
+            for key, fam in sorted(FAMILY_ALIASES.items(), key=lambda kv: -len(kv[0])):
+                if " " + key + " " in low:
+                    return fam
+        except Exception:
+            pass
+        return None
 
     def _find_confirm(self, frame):
         """Locate the green Confirm button via template match.
@@ -1371,6 +1589,7 @@ class StationShop:
         docstring for the confirmation model."""
         res = {"family": family, "confirm": confirm, "bought": False,
                "error": None, "dialog": None}
+        card_pages = 0  # card-row pages advanced (restored before every close)
         try:
             self.device.screencap()
             lair = cv2.imread(str(self.device.screencap_path))
@@ -1424,12 +1643,16 @@ class StationShop:
                     currency = self.read_currency(frame)
                     res["currency_retry"] = True
             res["currency"] = currency
-            cards = self.read_cards(frame)
-            res["cards"] = cards
-            card = next((c for c in cards if c["station"] == family), None)
+            card, frame, card_pages, page_cards = self._find_card(frame, family)
+            res["cards"] = page_cards
+            res["card_pages"] = card_pages
             if card is None:
+                self._restore_scroll(card_pages)
                 self._panel.close_panel()
-                res["error"] = f"no {family} card in the station panel"
+                res["error"] = (f"no {family} card in the station panel "
+                                f"after scanning {card_pages + 1} pages")
+                if self.locked_requirements:
+                    res["locked"] = list(self.locked_requirements)
                 return res
                 # all 5 currencies checked (was ice + green-only)
             cost_keys = ("cost_ice", "cost_poison", "cost_blood",
@@ -1439,6 +1662,7 @@ class StationShop:
                      for k in cost_keys if card[k] > 0
                      and card[k] > currency.get(k.replace("cost_", ""), 0)]
             if short:
+                self._restore_scroll(card_pages)
                 self._panel.close_panel()
                 need = ", ".join(f"{v} {r}" for r, v, _ in short)
                 have = ", ".join(
@@ -1475,6 +1699,7 @@ class StationShop:
             if dialog_frame is None:
                 # No dialog: unaffordable in game terms or a no-op tap. BACK is
                 # NOT needed (no dialog); just close the sheet.
+                self._restore_scroll(card_pages)
                 self._panel.close_panel()
                 res["error"] = "no confirm dialog appeared (unaffordable or not purchasable)"
                 return res
@@ -1493,11 +1718,13 @@ class StationShop:
             # wrong neighbor; refuse a mismatch instead of confirming.
             if dst != family and family not in dst and dst not in family:
                 self._back()
+                self._restore_scroll(card_pages)
                 self._panel.close_panel()
                 res["error"] = f"dialog mismatch: wanted {family}, dialog says {dst!r}"
                 return res
             if not confirm:
                 self._back()
+                self._restore_scroll(card_pages)
                 self._panel.close_panel()
                 # stash the staged two-phase buy so the planner's
                 # compelled follow-through gate can force the next
@@ -1558,6 +1785,7 @@ class StationShop:
             if self._panel._panel_open(cv2.imread(str(self.device.screencap_path))) \
                     or not self.bottombar.bar_visible(
                         cv2.imread(str(self.device.screencap_path))):
+                self._restore_scroll(card_pages)
                 self._panel.close_panel()
             return res
         except BoardLostError:
@@ -1567,6 +1795,7 @@ class StationShop:
             try:
                 if lair is not None and not self.bottombar.bar_visible(
                         cv2.imread(str(self.device.screencap_path))):
+                    self._restore_scroll(card_pages)
                     self._panel.close_panel()
             except Exception:  # noqa: BLE001
                 pass

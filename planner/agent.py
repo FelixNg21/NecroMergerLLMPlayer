@@ -9,6 +9,8 @@ from planner.constants import (
     CHEST_PREFIXES,
     GRAVE_CHAIN_PREFIXES,
     SATIETY_TOL_FRACTION,
+    SLIME_SPAWN_PREFIXES,
+    SLIME_SPAWN_PREFIXES,
     craved_matches,
     is_craved_precursor,
     item_name_matches,
@@ -35,7 +37,7 @@ NOOP_BACKOFF_STEPS = 10           # steps a no-op pair is excluded from merge ca
 # the actual reject reason should be feed_overflow, not feed_is_station.)
 STATION_PREFIXES = ("grave", "necromerger", "manapool")  # never feed these
 SPAWN_PREFIXES = ("grave",)                   # graves spawn via mana
-ALL_SPAWN_PREFIXES = SPAWN_PREFIXES + CHEST_PREFIXES  # any spawn station (grave + chest)
+ALL_SPAWN_PREFIXES = SPAWN_PREFIXES + CHEST_PREFIXES + SLIME_SPAWN_PREFIXES  # grave + chest + cupboard
 # Our own character: geometrically fixed in the TOP-RIGHT cell and never
 # merged. Its idle animation is too variable for reliable template matching, so
 # treat the cell as the necromerger station regardless of what the classifier
@@ -220,16 +222,30 @@ def _feedable_pool(feedable, *, feed_values, chain_map, max_level_ids,
     other, non-mergeable targets exist. Exact-or-possibly-craved cells are
     ALWAYS plain (feeding the craving is the point — the bonus + progress),
     and max-level ids are plain (their only action IS feeding). Material is
-    sacrificed only when nothing plain is feedable."""
+    sacrificed only when nothing plain is feedable.
+
+    UNKNOWN-VALUE PROTECTION: an item with no recorded feed value, no known
+    chain, and not max-level is in NEITHER pool — feeding it blind destroys
+    possibly-precious specimens for unknowable gain (observed: a
+    step-locally labeled eyeball fed while its sprite banked toward
+    consensus). Unknown-only boards yield no feed candidate (callers fall
+    back to merge/spawn); once banked, normal rules apply. Guarded on a
+    POPULATED book (non-empty feed_values): a knowledge-less planner
+    can't judge value, so everything stays feedable as before."""
     plain, material = [], []
+    book = feed_values or {}
     for c in feedable:
         if (craved_item
                 and craved_matches(c.item_id, craved_item,
                                    craving_level=craved_level)):
             plain.append(c)
+        elif c.item_id in (max_level_ids or ()):
+            plain.append(c)
         elif is_merge_material(c.item_id, chain_map=chain_map,
                                max_level_ids=max_level_ids):
             material.append(c)
+        elif book and book.get(c.item_id) is None:
+            continue  # unknown food value and no chain: don't eat blind
         else:
             plain.append(c)
     return plain, material
@@ -491,6 +507,8 @@ class HeuristicPlanner(Planner):
         merge_available = bool(ranked_merge_groups(
             board, max_level_ids=self.max_level_ids,
             chain_map=self.chain_map, craved_item=self.craved_item,
+            craved_level=getattr(self, "craved_level", None),
+            craved_need=getattr(self, "craved_need", None),
             exclude_pairs=self._noop.excluded()))
         return _should_feed(board, target, empty_count,
                             max_level_ids=self.max_level_ids,
@@ -526,11 +544,19 @@ class HeuristicPlanner(Planner):
         # is the ranking used by _spawn_move.
         grave_cands: list[Move] = []
         chest_cands: list[Move] = []
+        cup_cands: list[Move] = []
+        # Cupboard taps cost Slime and spawn eye components — only rank them
+        # when something wants eyes (eyemonster/eyeball/eyeinjar craving).
+        # Otherwise they clog the board for no objective. Slime level is
+        # unknown here; the validator's spawn_no_slime gate handles empty.
+        craved = (self.craved_item or "").lower()
+        want_eye = any(k in craved for k in ("eyemonster", "eyeball", "eyeinjar"))
         for cell in board.cells:
             if not cell.item_id:
                 continue
             is_grave = any(cell.item_id.startswith(p) for p in SPAWN_PREFIXES)
             is_chest = any(cell.item_id.startswith(p) for p in CHEST_PREFIXES)
+            is_cup = any(cell.item_id.startswith(p) for p in SLIME_SPAWN_PREFIXES)
             # A chest whose uses ran out may persist as a spent sprite (or be
             # removed by the game entirely). Never spawn-tap a spent state —
             # the Aug 26 live probe: double-taps on a used-up chest did
@@ -543,7 +569,7 @@ class HeuristicPlanner(Planner):
                                 for w in ("depleted", "empty",
                                           "spent", "opened")):
                 continue
-            if not (is_grave or is_chest):
+            if not (is_grave or is_chest or (is_cup and want_eye)):
                 continue
             if is_grave:
                 mana = read_mana_fraction(frame) if frame is not None else None
@@ -552,6 +578,11 @@ class HeuristicPlanner(Planner):
                 grave_cands.append((_level(cell.item_id), cell.row, cell.col,
                                     Move(kind="spawn", cell_a=(cell.row, cell.col),
                                          taps=SPAWN_TAPS)))
+            elif is_cup:
+                # cupboard spawn: slime cost, one tap per use
+                cup_cands.append((_level(cell.item_id), cell.row, cell.col,
+                                  Move(kind="spawn", cell_a=(cell.row, cell.col),
+                                       taps=CHEST_SPAWN_TAPS)))
             else:
                 # chest spawn: mana-free, one tap per use
                 chest_cands.append((_level(cell.item_id), cell.row, cell.col,
@@ -560,8 +591,12 @@ class HeuristicPlanner(Planner):
         # Sort each by level desc, then row/col for stable ordering.
         grave_cands.sort(key=lambda x: (-x[0], x[1], x[2]))
         chest_cands.sort(key=lambda x: (-x[0], x[1], x[2]))
-        # Chests outrank graves (chest is mana-free, finite-use; grave costs mana).
-        return [m for _, _, _, m in chest_cands] + [m for _, _, _, m in grave_cands]
+        cup_cands.sort(key=lambda x: (-x[0], x[1], x[2]))
+        # Chests outrank cupboards outrank graves (finite-use first, then
+        # slime-cost, then mana-cost).
+        return ([m for _, _, _, m in chest_cands]
+                + [m for _, _, _, m in cup_cands]
+                + [m for _, _, _, m in grave_cands])
 
     def _spawn_move(self, board, frame=None) -> Move | None:
         """Best spawn on the board (chest vs grave), board-space + mana gated.
@@ -651,6 +686,8 @@ class HeuristicPlanner(Planner):
                 ranked = ranked_merge_groups(board, max_level_ids=self.max_level_ids,
                                              chain_map=self.chain_map,
                                              craved_item=self.craved_item,
+                                             craved_level=getattr(self, "craved_level", None),
+                                             craved_need=getattr(self, "craved_need", None),
                                              exclude_pairs=excluded)
                 if ranked:
                     item_id, cells = ranked[0]
@@ -702,6 +739,8 @@ class HeuristicPlanner(Planner):
                 if (not ranked_merge_groups(board, max_level_ids=self.max_level_ids,
                                             chain_map=self.chain_map,
                                             craved_item=self.craved_item,
+                                            craved_level=getattr(self, "craved_level", None),
+                                            craved_need=getattr(self, "craved_need", None),
                                             exclude_pairs=excluded)
                         and self._spawn_move(board, frame) is None):
                     candidates = _feedable(board)

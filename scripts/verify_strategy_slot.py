@@ -465,12 +465,75 @@ def part_g_compile() -> None:
     check("G: py_compile clean", True)
 
 
+def part_h_direction() -> None:
+    """Suggested-direction line (replaces the retired periodic StrategyPlanner).
+
+    Code-evaluated meta-goals render when no strategy is fresh; silent when
+    a strategy is committed. Thresholds are None-safe (missing data never
+    fires — the old evaluator's darkness check fired unconditionally).
+    """
+    from vision.grid import build_cells
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        feats = [{"name": "Own a lvl 3+ Grave.", "progress": "0/1"}]
+        geom = GridGeometry(293, 1178, 230, 5, 3)
+        set_grid_geometry(geom)
+
+        def board(n_occupied: int):
+            cells = build_cells(geom)
+            for c in cells:
+                c.occupied = False
+                c.item_id = None
+            for c in cells[:n_occupied]:
+                c.occupied = True
+                c.item_id = "bone"
+                c.score = 0.9
+                c.margin = 0.5
+            return BoardState(5, 3, cells, geometry=geom)
+
+        p = make_planner(tmp, feats, step=5)
+        p._mana_fraction = 0.9
+        p._currency = {"ice": 100, "poison": 100, "blood": 0, "moon": 0, "death": 0}
+        p._last_champion = "peasant"
+        line = p._suggested_direction(board(5))
+        check("H1: champion present -> champion_combat",
+              "champion_combat" in line, line[:120])
+        p._last_champion = None
+        p._mana_fraction = 0.1
+        p._currency = {"ice": 100, "poison": 100, "blood": 0, "moon": 0, "death": 0}
+        line = p._suggested_direction(board(5))
+        check("H2: low mana, rich runes -> mana_generation",
+              "mana_generation" in line, line[:120])
+        p._mana_fraction = 0.9
+        p._currency = {}
+        line = p._suggested_direction(board(5))
+        check("H3: poor runes -> rune_economy",
+              "rune_economy" in line, line[:120])
+        line = p._suggested_direction(board(14))
+        check("H4: congested board -> board_management",
+              "board_management" in line, line[:120])
+        # fresh strategy suppresses the line (a direction is committed)
+        p._exec_set_strategy({"feat": "Own a lvl 3+ Grave."})
+        check("H5: fresh strategy -> silent",
+              p._suggested_direction(board(14)) == "")
+        # missing data never fires
+        p2 = make_planner(tmp, feats, step=5)
+        p2._mana_fraction = None
+        p2._currency = {}
+        p2._last_champion = None
+        p2.fallback.slime_count = None
+        p2.fallback.satiety_remaining = None
+        check("H6: sparse board, unknown data -> rune_economy (zero runes)",
+              "rune_economy" in p2._suggested_direction(board(2)))
+
+
 def main() -> None:
     global PASS
     set_grid_geometry(GridGeometry(293, 1178, 230, 5, 3))
     for part in (part_a_handler, part_b_freshness, part_c_weights,
                  part_d_board_line, part_d2_noun_classifier, part_e_offering,
-                 part_f_income, part_f2_station_hint, part_g_compile):
+                 part_f_income, part_f2_station_hint, part_g_compile,
+                 part_h_direction):
         try:
             part()
         except Exception as exc:  # noqa: BLE001

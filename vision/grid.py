@@ -167,6 +167,80 @@ class BoardState:
         return None
 
 
+def diff_boards(prev: BoardState, curr: BoardState, move=None) -> dict:
+    """Unexplained board changes between two consecutive classifies.
+
+    Compares occupancy + item ids cell by cell, then filters out diffs the
+    given move explains (merge transforms its two cells, feed empties its
+    cell, spawn lands up to 2 new items anywhere, attack may clear its
+    target). Same-cell id changes (bob-phase relabels) are vision noise
+    unless on a move cell — but move cells are already filtered, so any
+    remaining relabel is reported as a vanish+appear pair.
+
+    Returns {"appeared": [(r, c, item_id)], "vanished": [...],
+    "moved": [((r1, c1), (r2, c2), item_id)]} — all UNEXPLAINED, i.e.
+    game-side changes (champion spawn, reward arrival, board growth) or
+    misclassification worth surfacing to the summary. `move` is duck-typed
+    (kind/cell_a/cell_b/target) to avoid a planner import cycle.
+    """
+    def snap(board):
+        return {(c.row, c.col): (c.occupied, c.item_id) for c in board.cells}
+
+    before, after = snap(prev), snap(curr)
+    appeared, vanished = [], []
+    for rc in set(before) | set(after):
+        was_occ, was_id = before.get(rc, (False, None))
+        is_occ, is_id = after.get(rc, (False, None))
+        if is_occ and not was_occ:
+            appeared.append((rc[0], rc[1], is_id))
+        elif was_occ and not is_occ:
+            vanished.append((rc[0], rc[1], was_id))
+        elif was_occ and is_occ and was_id != is_id:
+            vanished.append((rc[0], rc[1], was_id))
+            appeared.append((rc[0], rc[1], is_id))
+
+    kind = getattr(move, "kind", None)
+    if kind == "merge":
+        touched = set()
+        for m in (move.cell_a, move.cell_b):
+            if m is not None:
+                touched.add((m[0], m[1]))
+        appeared = [a for a in appeared if (a[0], a[1]) not in touched]
+        vanished = [v for v in vanished if (v[0], v[1]) not in touched]
+    elif kind == "feed" and move.cell_a is not None:
+        vanished = [v for v in vanished
+                    if (v[0], v[1]) != (move.cell_a[0], move.cell_a[1])]
+    elif kind == "spawn":
+        appeared = appeared[2:] if len(appeared) > 2 else []
+    elif kind == "attack" and getattr(move, "target", None) is not None:
+        t = (move.target[0], move.target[1])
+        appeared = [a for a in appeared if (a[0], a[1]) != t]
+        vanished = [v for v in vanished if (v[0], v[1]) != t]
+
+    # Moved = same id vanished somewhere, appeared elsewhere (game-side
+    # motion or paired mislabels). Pair greedily; None ids never pair.
+    moved = []
+    van_ids: dict = {}
+    for v in vanished:
+        if v[2] is not None:
+            van_ids.setdefault(v[2], []).append(v)
+    used_v, used_a = set(), set()
+    for i, a in enumerate(appeared):
+        if a[2] is None or i in used_a:
+            continue
+        cands = [v for v in van_ids.get(a[2], [])
+                 if (v[0], v[1]) not in used_v
+                 and (v[0], v[1]) != (a[0], a[1])]
+        if cands:
+            v = cands[0]
+            used_v.add((v[0], v[1]))
+            used_a.add(i)
+            moved.append(((v[0], v[1]), (a[0], a[1]), a[2]))
+    appeared = [a for i, a in enumerate(appeared) if i not in used_a]
+    vanished = [v for v in vanished if (v[0], v[1]) not in used_v]
+    return {"appeared": appeared, "vanished": vanished, "moved": moved}
+
+
 def build_cells(geometry: GridGeometry | None = None) -> list[Cell]:
     geom = _geom(geometry)
     cells = []

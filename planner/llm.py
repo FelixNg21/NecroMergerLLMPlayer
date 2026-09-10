@@ -34,6 +34,7 @@ from planner.constants import (
     CHEST_PREFIXES,
     MERGE_MIN_MARGIN,
     SATIETY_TOL_FRACTION,
+    SLIME_SPAWN_PREFIXES,
     craved_matches,
     is_craved_precursor,
 )
@@ -394,12 +395,14 @@ class LLMPlanner(Planner):
                   damage_values: dict | None = None,
                   satiety_remaining: int | None = None,
                   satiety_capacity: int | None = None,
-                  craved_item: str | None = None,
-                  craved_level: int | None = None,
-                  craving_bonus: int = 0,
-                  prefer_item: str | None = None,
+                   craved_item: str | None = None,
+                   craved_level: int | None = None,
+                   craving_bonus: int = 0,
+                   craving_need: int | None = None,
+                   prefer_item: str | None = None,
                   chain_map: dict[str, list[str]] | None = None,
-                  protect_family: str | None = None) -> str | None:
+                  protect_family: str | None = None,
+                  slime_count: int | None = None) -> str | None:
         """Return a reason string if the move is invalid, else None.
 
         The reason includes the offending item ids / margins so "why did this
@@ -492,17 +495,35 @@ class LLMPlanner(Planner):
                         and _same_family_diff_level(cell.item_id, cell.runner_up_id)):
                     return (f"merge_neighbor_suspect:{cell.item_id}/"
                             f"{cell.runner_up_id}@m{cell.margin:.2f}")
+            # Craving-material protection (Sep 7): merging the last pair of
+            # the EXACT craved id/level into the next level starves the
+            # craving (observed: two eyemonster_lvl1 merged to lvl2, then
+            # the lvl2 fed for zero craving credit). Fires only on full
+            # knowledge (menu-read level + remaining need); precursor
+            # merges and surplus merges are unaffected.
+            if (craved_level is not None and craving_need is not None
+                    and craving_need > 0
+                    and craved_matches(a.item_id, craved_item,
+                                       craving_level=craved_level)):
+                n_same = sum(1 for c in board.cells if c.item_id == a.item_id)
+                if (n_same - 2) < craving_need:
+                    return f"merge_craving_material:{a.item_id}"
             return None
         if move.kind == "spawn":
             if a is None or a.item_id is None:
                 return cell_reason("cell_a", a)
             is_grave = any(a.item_id.startswith(p) for p in SPAWN_PREFIXES)
             is_chest = any(a.item_id.startswith(p) for p in CHEST_PREFIXES)
-            if not (is_grave or is_chest):
+            is_cupboard = any(a.item_id.startswith(p) for p in SLIME_SPAWN_PREFIXES)
+            if not (is_grave or is_chest or is_cupboard):
                 return f"spawn_not_grave:{a.item_id}"
             if is_grave and mana is not None and mana < SPAWN_MANA_MIN:
                 return f"spawn_low_mana:{mana:.2f}"
             # chest is mana-free — no low-mana gate
+            # cupboard costs Slime, not mana: refuse only on a known-empty
+            # vat (scale ungrounded beyond that; _verify_spawn logs no-ops).
+            if is_cupboard and slime_count is not None and slime_count <= 0:
+                return f"spawn_no_slime:{slime_count}"
             # A spawn on a full board silently no-ops (the Aug 25 spawn-spam:
             # 17 spawns onto a 20/20-full board while merge hints showed).
             if not any(not c.occupied for c in board.cells):
@@ -536,20 +557,22 @@ class LLMPlanner(Planner):
             material = (is_merge_material(a.item_id, chain_map=chain_map,
                                           max_level_ids=max_level)
                         and not is_craved and a.item_id != prefer_item)
+            # any cell that COULD be fed (non-station, non-champion),
+            # excluding the candidate cell itself. Hoisted: shared by the
+            # merge-material, unknown-value, and strategy guards below.
+            def _other_feedable(c):
+                return (c.item_id and c.occupied
+                        and (c.row, c.col) != (a.row, a.col)
+                        and not c.item_id.startswith(CHAMPION_PREFIXES)
+                        and not any(c.item_id.startswith(p)
+                                    for p in STATION_PREFIXES))
+            any_plain_feedable = any(
+                _other_feedable(c)
+                and not is_merge_material(c.item_id, chain_map=chain_map,
+                                          max_level_ids=max_level)
+                for c in board.cells)
+            has_free_cell = any(not c.occupied for c in board.cells)
             if material:
-                # any cell that COULD be fed (non-station, non-champion),
-                # excluding the candidate cell itself.
-                def _other_feedable(c):
-                    return (c.item_id and c.occupied
-                            and (c.row, c.col) != (a.row, a.col)
-                            and not c.item_id.startswith(CHAMPION_PREFIXES)
-                            and not any(c.item_id.startswith(p)
-                                        for p in STATION_PREFIXES))
-                any_plain_feedable = any(
-                    _other_feedable(c)
-                    and not is_merge_material(c.item_id, chain_map=chain_map,
-                                              max_level_ids=max_level)
-                    for c in board.cells)
                 if any_plain_feedable:
                     return f"feed_merge_material:{a.item_id}"
                 # DESPERATION fallback: no plain feedable exists, so we may
@@ -561,7 +584,6 @@ class LLMPlanner(Planner):
                 # exist right now (a "not congested" board with free space must
                 # NOT feed merge material; empty cells aren't feedable, so the
                 # plain-feedable check above would otherwise let it through).
-                has_free_cell = any(not c.occupied for c in board.cells)
                 if has_free_cell:
                     return f"feed_merge_material:{a.item_id}"
                 # Board is full: if this material is on the ACTIVE STRATEGY'S
@@ -573,6 +595,34 @@ class LLMPlanner(Planner):
                 if (protect_family and a.item_id.startswith(protect_family)
                         and any(_other_feedable(c) for c in board.cells)):
                     return f"feed_strategy_material:{a.item_id}"
+            # UNKNOWN-VALUE PROTECTION: the item has no recorded feed value
+            # and belongs to no known merge chain — feeding it blind destroys
+            # possibly-precious specimens for unknowable gain (observed: a
+            # step-locally labeled eyeball fed for ~1 food while its sprite
+            # was still banking toward consensus). Refuse while any plain
+            # feedable exists; on a genuinely full board with nothing else,
+            # allow rather than stall (mirrors merge-material desperation).
+            # Craved items bypass (a craving is an explicit food order).
+            # Guarded on a POPULATED book: with empty feed_values the
+            # planner knows nothing at all, so everything would be
+            # "unknown" — fall back to the old permissive behavior.
+            if (not is_craved and a.item_id != prefer_item
+                    and (feed_values or {})
+                    and (feed_values or {}).get(a.item_id) is None
+                    and not is_merge_material(a.item_id, chain_map=chain_map,
+                                              max_level_ids=max_level)):
+                # "Plain" here means genuinely feedable (known value, max,
+                # or material) — other unknown-value cells must not count,
+                # or a board of only unknowns refuses forever (stall).
+                any_known_feedable = any(
+                    _other_feedable(c)
+                    and ((feed_values or {}).get(c.item_id) is not None
+                         or c.item_id in (max_level or ())
+                         or is_merge_material(c.item_id, chain_map=chain_map,
+                                              max_level_ids=max_level))
+                    for c in board.cells)
+                if any_known_feedable or has_free_cell:
+                    return f"feed_unknown_value:{a.item_id}"
             is_income_stack = any(
                 a.item_id.startswith(fam) or fam in a.item_id
                 for fam in INCOME_FAMILIES)

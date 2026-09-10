@@ -59,6 +59,27 @@ GESTURE_FAIL_LIMIT = 5
 TITLE_CONTINUE_XY = (654, 1570)
 
 
+def _rotate_logs(chat_path: Path, max_bytes: int = 8 * 1024 * 1024) -> None:
+    """Rotate run logs at startup so they can't grow unbounded.
+
+    session.jsonl and llm_chats.jsonl append across runs (observed 3.8MB+
+    chat logs slowing the summary to a 240s timeout). When either exceeds
+    max_bytes, move it to .bak (single backup, overwritten) and start
+    fresh. In-memory history (SessionLog.events) is unaffected — only the
+    on-disk files rotate, and rotation happens before any logging.
+    """
+    for p in (Path("session.jsonl"), Path(chat_path)):
+        try:
+            if p.exists() and p.stat().st_size > max_bytes:
+                bak = p.with_suffix(p.suffix + ".bak")
+                if bak.exists():
+                    bak.unlink()
+                p.rename(bak)
+                print(f"  [rotated {p} ({max_bytes // 1048576}MB+) -> {bak}]")
+        except OSError as exc:
+            print(f"  [log rotation skipped for {p}: {exc}]")
+
+
 def _recover_device(device: Device, log: SessionLog) -> bool:
     """Bring the game back to the lair after repeated gesture failures.
 
@@ -90,6 +111,41 @@ def _recover_device(device: Device, log: SessionLog) -> bool:
                 pass
     log.log("device_recovery", stage="failed")
     return False
+
+
+def _verify_spawn(device, move, board, log, classifier):
+    """After a spawn tap, screencap + reclassify. A spawn produces a new
+    item (new occupied cell, or a changed cell where it landed), so an
+    identical board means the tap silently no-oped (drained station, empty
+    mana the validator misread, or a missed tap). Logs `spawn_noop` with
+    the station id for the summary to consolidate — detection only, no
+    retry (retrying blind taps on a possibly-drained station wastes uses).
+    Returns the (latest) frame. Never raises (all failures log).
+    """
+    from vision.pipeline import classify_board as _classify
+    try:
+        device.wait_for_idle(MERGE_SETTLE_MS / 1000.0)
+        device.screencap()
+        frame = cv2.imread(str(device.screencap_path))
+        if frame is None:
+            return frame
+        before = {(c.row, c.col): c.item_id for c in board.cells if c.occupied}
+        after_board = _classify(frame, classifier)
+        after = {(c.row, c.col): c.item_id for c in after_board.cells if c.occupied}
+        if after == before:
+            station = board.cell_at(*move.cell_a)
+            log.log("spawn_noop", cell_a=move.cell_a,
+                    station=station.item_id if station else None)
+            print(f"  [spawn no-op at {move.cell_a} — board unchanged]")
+        return frame
+    except Exception as exc:
+        log.log("spawn_noop", cell_a=move.cell_a,
+                error=f"{type(exc).__name__}: {exc}")
+        try:
+            device.screencap()
+            return cv2.imread(str(device.screencap_path))
+        except Exception:
+            return None
 
 
 def _verify_merge(device, layout, move, pre_ids, log, classifier, planner):
@@ -127,9 +183,104 @@ def _verify_merge(device, layout, move, pre_ids, log, classifier, planner):
                             error=f"retry swipe failed (exit {exc.returncode})")
                     return frame
                 continue
-            print("  [merge still no-op after retry — continuing]")
+            print("  [merge still no-op after retry — identifying cells]")
+            _identify_noop_cells(board, frame, move, pre_ids, log,
+                                 classifier, planner)
         return frame
     return frame
+
+
+def _identify_noop_cells(board, frame, move, pre_ids, log, classifier, planner) -> None:
+    """Self-improvement on a confirmed merge no-op: popup-identify both cells.
+
+    A no-op means at least one label was wrong (same-id pair the game
+    refuses) or both are an unknown max level. Either way the bank is
+    missing truth: popup-read both cells, bank the sprite templates under
+    the true ids plus the popup recipes (feed/damage/max-level), and log
+    `noop_identified` with before/after ids so the session summary folds
+    it into learnings/glossary. Next time these sprites classify correctly
+    (mislabeled pair never proposed) or gate correctly (newly-known max
+    level refuses the merge up front). Bounded to 2 taps, only on confirmed
+    no-ops (post-retry), vision-drive only (owns `discover`); all failures
+    log and never stall the loop.
+    """
+    discover = getattr(planner, "discover", None) if planner is not None else None
+    if discover is None or board is None or frame is None:
+        return
+    classifier = getattr(planner, "classifier", None)
+    known_families = set()
+    if classifier is not None:
+        try:
+            known_families = {t.split("_lvl")[0]
+                              for t in classifier.templates}
+        except Exception:
+            known_families = set()
+    for pos, pre in ((move.cell_a, pre_ids[0]), (move.cell_b, pre_ids[1])):
+        try:
+            target = board.cell_at(*pos)
+            if target is None:
+                continue
+            item_id, info = discover(target, frame)
+            if not item_id:
+                continue
+            info = info or {}
+            if info.get("error"):
+                log.log("noop_identify_failed", cell=list(pos),
+                        error=info.get("error"))
+                continue
+            # Trust gate: a noop cell already had a confident label, so a
+            # freshly-minted UNKNOWN base (OCR fragment like "be_lvl2",
+            # observed Sep 5) is evidence of a bad read, not a new item —
+            # banking it would poison the bank AND the glossary. Only bank
+            # when the id is already known or its base matches a banked
+            # family. Genuine new items never reach here (UNID cells can't
+            # be proposed for merges).
+            base = item_id.split("_lvl")[0]
+            trusted = (classifier is not None
+                       and (classifier.has(item_id) or base in known_families))
+            if not trusted:
+                log.log("noop_identify_rejected", cell=list(pos), was=pre,
+                        now=item_id,
+                        reason="unknown base; refusing to bank")
+                print(f"  [noop read rejected: {pos} {pre} -> {item_id} (unknown base)]")
+                continue
+            if hasattr(planner, "_bank_popup_recipe"):
+                try:
+                    planner._bank_popup_recipe(item_id, info)
+                except Exception:
+                    pass
+            bank_ok = False
+            if classifier is not None:
+                try:
+                    planner._frame = frame
+                    planner._bank_unid_sprite(target, item_id)
+                    bank_ok = True
+                except Exception:
+                    pass
+            # Max-level signal: popup says only "Feed to the Devourer."
+            # with no merge line — the same ground truth the max-level
+            # gate runs on. Banking the recipe above already records it;
+            # surfaced here so the event is self-describing.
+            desc = (info.get("description") or "").lower()
+            merge_info = (info.get("merge_info") or "").lower()
+            feed_only = "feed to the devourer" in desc and "merge" not in merge_info
+            log.log("noop_identified", cell=list(pos), was=pre,
+                    now=item_id, feed_only=feed_only,
+                    sprite_banked=bank_ok, sig=info.get("sig"),
+                     digit=info.get("digit"), ocr=info.get("ocr"),
+                     level=info.get("level"),
+                     overruled=info.get("overruled"))
+            _note = getattr(planner, "note_identified", None)
+            if _note is not None:
+                try:
+                    _note(tuple(pos), item_id)
+                except Exception:
+                    pass
+            print(f"  [noop learn: {pos} was {pre}, popup says {item_id}]")
+        except Exception as exc:
+            log.log("noop_identify_failed", cell=list(pos),
+                    error=f"{type(exc).__name__}: {exc}")
+            continue
 
 
 def make_planner(name: str, llm_url: str | None = None,
@@ -151,8 +302,7 @@ def make_planner(name: str, llm_url: str | None = None,
                  hints=True,
                  shop=None,
                  queue_box=None,
-                 slime_vat=None,
-                 strategy_interval: int = 20) -> Planner:
+                 slime_vat=None) -> Planner:
     if name == "heuristic":
         return HeuristicPlanner()
     if name == "llm":
@@ -189,13 +339,34 @@ def make_planner(name: str, llm_url: str | None = None,
                                       slime_vat=slime_vat,
                                       champions=champions,
                                       hints=hints,
-                                      shop=shop,
-                                      queue_box=queue_box,
-                                      strategy_interval=strategy_interval)
+                                       shop=shop,
+                                       queue_box=queue_box)
     raise ValueError(f"unknown planner: {name}")
 
 
-def capture_unknowns(frame, board, classifier, counts) -> tuple[list, list]:
+def _matches_seed(classifier, item_id: str, crop, floor: float = 0.20) -> bool:
+    """True when `crop` resembles item_id's hand-verified seed template.
+
+    Matches the seed (`<id>__0.png`, the calibration capture) inside the
+    cell crop — the same direction the classifier scores. True bob-phase
+    variants correlate moderately; wrong-level sprites score ~0.08
+    (observed Sep 5). Missing seed/unreadable crop -> True (never block
+    on missing data).
+    """
+    try:
+        seed = cv2.imread(str(Path("assets/templates") / f"{item_id}__0.png"),
+                          cv2.IMREAD_GRAYSCALE)
+        if seed is None or crop is None or getattr(crop, "size", 0) == 0:
+            return True
+        g = crop if len(crop.shape) == 2 else cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        if seed.shape[0] > g.shape[0] or seed.shape[1] > g.shape[1]:
+            return True
+        return float(cv2.matchTemplate(g, seed, cv2.TM_CCOEFF_NORMED).max()) >= floor
+    except Exception:
+        return True
+
+
+def capture_unknowns(frame, board, classifier, counts, log=None) -> tuple[list, list]:
     """Classify below-threshold occupied cells into two buckets.
 
     Returns (to_identify, accumulated):
@@ -225,8 +396,23 @@ def capture_unknowns(frame, board, classifier, counts) -> tuple[list, list]:
         if best_id and best_id.startswith(STATION_PREFIXES):
             continue  # known station dipping; ignore, planner hardcodes it
         if best_id and score >= KNOWN_DIP_MIN:
-            classifier.add_template(best_id, crop_cell(frame, cell.row, cell.col))
-            accumulated.append((cell.row, cell.col, best_id, round(score, 3), counts[key]))
+            # Seed guard: only fold the dip phase into the bank when the crop
+            # still resembles the id's hand-verified seed template (__0).
+            # Without this, a mislabeled cell banks its (wrong-level) sprite
+            # under the guessed id, and later dips match the pollutant and
+            # bank more of them — self-reinforcing level confusion (observed
+            # Sep 5: fourteen lvl6 sprites in the lvl5 bank, all ~0.08 vs the
+            # lvl5 seed while matching lvl6 at 0.9+). Floor is permissive on
+            # purpose (true bob phases correlate moderately); rejections log
+            # for calibration.
+            if _matches_seed(classifier, best_id,
+                             crop_cell(frame, cell.row, cell.col)):
+                classifier.add_template(best_id, crop_cell(frame, cell.row, cell.col))
+                accumulated.append((cell.row, cell.col, best_id, round(score, 3), counts[key]))
+            else:
+                if log is not None:
+                    log.log("accumulate_seed_rejected", cell=(cell.row, cell.col),
+                            best=best_id, score=round(score, 3))
             continue
         path = REVIEW_DIR / f"cell_{cell.row}_{cell.col}__{counts[key]}.png"
         cv2.imwrite(str(path), crop_cell(frame, cell.row, cell.col))
@@ -256,7 +442,7 @@ def main():
                         help="vision-drive screenshot long-side cap (default 1536 = ~half res; "
                              "set 0/None for full 1280x2856)")
     parser.add_argument("--summarize-every", type=int, default=5,
-                        help="vision-drive: update learnings every N steps (0 = only at session end)")
+                        help="vision-drive: run memory maintenance every N steps (deterministic folds; full LLM pattern-mining every 10th + session end; 0 = only at session end)")
     parser.add_argument("--no-wiki-factcheck", action="store_true",
                         help="vision-drive: skip wiki fact-checking of candidate learnings in summarize")
     parser.add_argument("--no-wiki-tool", action="store_true",
@@ -286,6 +472,7 @@ def main():
     templates_dir = seed_dir or "assets/templates"
     classifier = TemplateClassifier(templates_dir, seed=True)
     levelup = LevelUpScreen()
+    _rotate_logs(Path(args.llm_log) if args.llm_log else Path("llm_chats.jsonl"))
     log = SessionLog()
     live = not args.dry_run and args.screenshot is None
     # Planner brain: --screenshot is a frozen OFFLINE regression check (no
@@ -352,15 +539,26 @@ def main():
     except LLMError as exc:
         raise SystemExit(str(exc))
     unknown_counts: dict[tuple[int, int], int] = {}
+    prev_board = None   # last step's classified board (board evolution memory)
+    prev_move = None    # move executed into the current board (explains diffs)
     summarize_every = args.summarize_every if live else 0
     identifier = None
 
     # Board geometry: the layout changes with game state (board grows as the
     # Devourer levels), so the 5x3 constants are only a fallback. Read it once
-    # from the live screen via the vision LLM (validated + refined against
-    # template anchors); fall back to the calibrated constants on any failure.
+    # from the live screen: pinned config dims first (no LLM round — the grid
+    # only changes on board-expansion feat rewards), else the vision LLM
+    # (validated + refined against template anchors); fall back to the
+    # calibrated constants on any failure. A first successful detect
+    # self-seeds the config for future runs.
     geometry = grid.FALLBACK_GEOMETRY
     if live:
+        from vision.geometry import (NoFloorBlobError, llm_grid_geometry,
+                                      read_board_dims, write_board_dims)
+        pinned = read_board_dims()
+        if pinned is not None:
+            print(f"  [geometry: pinned dims {pinned[0]}x{pinned[1]} "
+                  f"(no LLM round)]")
         max_attempts = 5
         attempts = 0
         while attempts < max_attempts:
@@ -368,10 +566,15 @@ def main():
                 device.screencap()
                 geom_frame = cv2.imread(str(device.screencap_path))
                 if geom_frame is not None:
-                    from vision.geometry import llm_grid_geometry, NoFloorBlobError
-                    geometry = llm_grid_geometry(geom_frame, llm_client, classifier)
+                    geometry = llm_grid_geometry(
+                        geom_frame, None if pinned else llm_client,
+                        classifier, prior_dims=pinned)
                     grid.set_grid_geometry(geometry)
                     print(f"  [geometry read successful on attempt {attempts + 1}]")
+                    if (geometry.rows, geometry.cols) != pinned:
+                        if write_board_dims(geometry.rows, geometry.cols):
+                            print(f"  [geometry: config (re)seeded "
+                                  f"{geometry.rows}x{geometry.cols}]")
                     break
                 else:
                     raise RuntimeError("Unable to read screenshot for geometry read.")
@@ -477,7 +680,35 @@ def main():
                         continue
 
             board = classify_board(frame, classifier)
-            unknown, accumulated = capture_unknowns(frame, board, classifier, unknown_counts)
+            # Popup-label persistence: a popup-resolved id (e.g.
+            # eyemonster_lvl1) overrules a template flip-flop inside a
+            # template-indistinguishable pair until the cell genuinely
+            # changes. Applied BEFORE unknown-capture so persisted cells
+            # don't re-trigger identify taps. Planner-agnostic (no-op for
+            # planners without the memory); never stalls the loop.
+            try:
+                _apply_mem = getattr(planner, "apply_label_memory", None)
+                if _apply_mem is not None:
+                    _n_mem = _apply_mem(board, prev_move)
+                    if _n_mem:
+                        print(f"  [label memory: {int(_n_mem)} cell(s) restored]")
+            except Exception as exc:
+                log.log("label_memory", error=f"{type(exc).__name__}: {exc}")
+            # Board evolution memory: diff against last step unexplained by
+            # the move that produced this board. Game-side changes (champion
+            # spawn, reward arrival, board growth) surface here for the
+            # summary to learn from; our own moves are filtered by kind.
+            if prev_board is not None and prev_move is not None:
+                try:
+                    from vision.grid import diff_boards
+                    _bd = diff_boards(prev_board, board, prev_move)
+                    if _bd["appeared"] or _bd["vanished"] or _bd["moved"]:
+                        log.log("board_diff", appeared=_bd["appeared"][:6],
+                                vanished=_bd["vanished"][:6], moved=_bd["moved"][:4],
+                                after=prev_move.kind)
+                except Exception as exc:
+                    log.log("board_diff", error=f"{type(exc).__name__}: {exc}")
+            unknown, accumulated = capture_unknowns(frame, board, classifier, unknown_counts, log)
             for row, col, best_id, score, n in accumulated:
                 log.log("accumulate", cell=(row, col), best=best_id, score=score, frame=n)
             for row, col, best_id, score, n in unknown:
@@ -503,6 +734,12 @@ def main():
                     cell.item_id = item_id
                     cell.score = 1.0
                     cell.margin = 1.0
+                    _note = getattr(planner, "note_identified", None)
+                    if _note is not None:
+                        try:
+                            _note((row, col), item_id)
+                        except Exception:
+                            pass
                     log.log("identify", cell=(row, col), item_id=item_id, **info)
                     print(f"  identified ({row},{col}) -> {item_id}  {info}")
                     identified += 1
@@ -541,12 +778,15 @@ def main():
                 gesture_fails = 0
                 if move.kind == "merge":
                     frame = _verify_merge(device, layout, move, pre_ids, log, classifier, planner)
+                elif move.kind == "spawn":
+                    frame = _verify_spawn(device, move, board, log, classifier)
                 device.wait_for_idle()
+                prev_board, prev_move = board, move
             step += 1
             if (live and summarize_every and step % summarize_every == 0
                     and isinstance(planner, VisionDrivenPlanner)):
                 try:
-                    if planner.summarize_session(board, frame):
+                    if planner.maintain_memory(board, frame):
                         print(f"  [learnings updated @ step {step}]")
                 except Exception as exc:
                     print(f"  learnings update failed: {exc}")

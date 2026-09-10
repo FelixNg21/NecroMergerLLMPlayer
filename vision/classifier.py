@@ -8,6 +8,11 @@ from vision.grid import Cell
 # A runtime-banked template below this gray std is background, not a sprite —
 # refused by add_template (see its docstring for the incident this prevents).
 MIN_TEMPLATE_STD = 15.0
+# Per-id template cap: the bank grows a variant per dip-phase observation and
+# would accumulate forever (observed 60+ skeleton_lvl5/lvl6 files). Past this
+# many frames the oldest non-seed variant is evicted (file + memory) on add.
+# The __0 calibration seed is never evicted.
+MAX_TEMPLATES_PER_ID = 40
 
 
 class ItemClassifier:
@@ -31,10 +36,12 @@ class TemplateClassifier(ItemClassifier):
     def __init__(self, templates_dir="assets/templates", threshold=0.6, seed=True):
         self.templates_dir = templates_dir
         self.templates: dict[str, list[np.ndarray]] = {}
+        self._template_files: dict[str, list] = {}
         if seed:
             for path in sorted(Path(templates_dir).glob("*.png")):
                 item_id = path.stem.split("__")[0]      # "skeleton_lvl1__0" -> "skeleton_lvl1"
                 self.templates.setdefault(item_id, []).append(cv2.imread(str(path)))
+                self._template_files.setdefault(item_id, []).append(path)
         self.threshold = threshold
 
     def _score_top2(self, frame, cell: Cell) -> tuple[str | None, float, float, str | None]:
@@ -95,6 +102,10 @@ class TemplateClassifier(ItemClassifier):
         vanished chest's empty cell was banked as `icebox_unopened`, then
         matched itself at 1.00 and masked the cell being empty). Returns
         True when the template was stored.
+
+        Filenames use max-index+1 (not len(frames): deletions leave holes
+        that len() would collide with). Past MAX_TEMPLATES_PER_ID the
+        oldest non-seed variant is evicted (memory + disk); __0 never is.
         """
         if crop is None:
             return False
@@ -105,10 +116,25 @@ class TemplateClassifier(ItemClassifier):
         if float(gray.std()) < MIN_TEMPLATE_STD:
             return False
         frames = self.templates.setdefault(item_id, [])
-        path = Path(self.templates_dir) / f"{item_id}__{len(frames)}.png"
+        files = self._template_files.setdefault(item_id, [])
+        indices = [int(m.group(1)) for p in files
+                   for m in [re.search(r"__(\d+)\.png$", str(p))]
+                   if m] if files else []
+        path = Path(self.templates_dir) / f"{item_id}__{(max(indices) + 1) if indices else 0}.png"
         path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(path), crop)
         frames.append(crop)
+        files.append(path)
+        while len(frames) > MAX_TEMPLATES_PER_ID:
+            victim = 1 if len(files) > 1 and str(files[0]).endswith("__0.png") else 0
+            if len(files) <= 1:
+                break
+            old = files.pop(victim)
+            frames.pop(victim)
+            try:
+                Path(old).unlink(missing_ok=True)
+            except OSError:
+                pass
         return True
 
     def has(self, item_id: str) -> bool:

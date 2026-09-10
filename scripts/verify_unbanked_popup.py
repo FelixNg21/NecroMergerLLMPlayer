@@ -340,6 +340,53 @@ def part_k_feed_mana_overflow_unconditional():
           reason is None, f"got {reason!r}")
 
 
+def part_l_eye_component_remap_and_vote():
+    """Eye-family remap + signature-dispute vote (Sep 6).
+
+    The banked `eyeball` signature matched an "Eye Monster Lvl 1" title at
+    1.0 while the digit read 1 and OCR read "fuemonster". Two guards now
+    cover this: (1) `_resolve_id` remaps an unlevelled eye base to the
+    leveled form on a trusted level (incl. defeating a same-form sprite
+    match via the conflict fall-through); (2) `_sig_disputed` fires only
+    on two-against-one (LLM + OCR vs signature). Uses an empty temp bank
+    so no template-file fixture is needed."""
+    import numpy as np
+    from vision.identify import Identifier
+    from vision.classifier import TemplateClassifier
+
+    check("L-1: eye dispute vote fires (sig vs LLM+OCR)",
+          Identifier._sig_disputed("eyeball", "eyemonster", "fuemonster") is True)
+    check("L-2: OCR-only mangling keeps signature",
+          Identifier._sig_disputed("zombie", "zombie", "tonbie") is False)
+    check("L-3: LLM-only disagreement keeps signature",
+          Identifier._sig_disputed("eyeball", "eyemonster", "eyeball") is False)
+    check("L-4: empty LLM name keeps signature",
+          Identifier._sig_disputed("eyeball", "", "fuemonster") is False)
+
+    with tempfile.TemporaryDirectory() as td:
+        bank = Path(td) / "bank"
+        bank.mkdir()
+        clf = TemplateClassifier(str(bank))
+        ident = Identifier.__new__(Identifier)
+        ident.classifier = clf
+        sprite = np.zeros((100, 100, 3), dtype=np.uint8)
+        check("L-5: eyeball + trusted lvl1 -> eyemonster_lvl1",
+              ident._resolve_id("eyeball", 1, sprite, level_trusted=True)
+              == "eyemonster_lvl1")
+        check("L-6: eyeball, no level -> eyeball",
+              ident._resolve_id("eyeball", None, sprite,
+                                level_trusted=False) == "eyeball")
+        check("L-7: eyeball + untrusted lvl1 stays conservative",
+              ident._resolve_id("eyeball", 1, sprite,
+                                level_trusted=False) == "eyeball_lvl1")
+        check("L-8: eyeinajar + trusted lvl2 -> eyemonster_lvl2",
+              ident._resolve_id("eyeinajar", 2, sprite,
+                                level_trusted=True) == "eyemonster_lvl2")
+        check("L-9: non-eye base unaffected (bone + trusted lvl)",
+              ident._resolve_id("bone", 1, sprite,
+                                level_trusted=True) == "bone_lvl1")
+
+
 def main() -> None:
     for part in (part_a_unid_fallback, part_b_banked_preferred,
                  part_c_resolve_unid_popup, part_d_resolve_refuses_empty,
@@ -347,7 +394,8 @@ def main() -> None:
                  part_f_unid_cell_picked, part_g_champion_prefix_skipped,
                  part_h_no_alt_templates, part_i_no_alt_glossary,
                  part_j_resolve_id_no_alt,
-                 part_k_feed_mana_overflow_unconditional):
+                 part_k_feed_mana_overflow_unconditional,
+                 part_l_eye_component_remap_and_vote):
         try:
             part()
         except Exception as exc:  # noqa: BLE001

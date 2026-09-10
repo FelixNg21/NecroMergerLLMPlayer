@@ -41,6 +41,15 @@ CHEST_SPAWN_PREFIXES = ("icerune", "poisonrune")
 # from them was wrongly rejected as `spawn_not_grave`.)
 CHEST_PREFIXES = ("icebox", "lockedchest", "valuablechest")
 
+# Slime-cost spawn stations: the Supply Cupboard spawns eye components for
+# Slime (wiki: lvl1 ~1000/tap; higher levels cost more), and the Fridge
+# likewise costs Slime to use (wiki: lvl1 500/tap-scale costs; Tier-13
+# unlock). Mana-free like chests, but gated on Slime instead. Every
+# consumer (validator, hints, whitelist, tags, fallback) reads this tuple,
+# so grounding a new station's cost only requires adding its prefix here.
+# Stations with ungrounded costs stay out (no invention).
+SLIME_SPAWN_PREFIXES = ("supplycupboard", "fridge")
+
 # The full grave-spawn family (bone -> ribcage -> skeletonN): members are cheaply
 # rebuilt via the grave's chain, so sacrificing one to a craving when it would
 # overflow the bar is unnecessary — spawning to rebuild it is preferred.
@@ -102,6 +111,37 @@ def normalize_item_name(name: str) -> str:
     craving/menu name to its board cells, so every craving match normalizes
     both sides through here (see item_name_matches)."""
     return "".join(ch for ch in (name or "").lower() if ch.isalnum())
+
+
+# Canonical station family -> spaced display name for model-facing text.
+# Probed live: this thinking model derails mid-reasoning on compound
+# words ("supplycupboard" burns the whole budget; "grave" lands), so every
+# prompt, example call, and compel message uses the SPACED form, and every
+# intake canonicalizes via canonical_family(). Single-word families
+# display as-is.
+STATION_DISPLAY_NAMES = {
+    "supplycupboard": "supply cupboard",
+    "manapool": "mana pool",
+    "foulchicken": "foul chicken",
+    "slimevat": "slime vat",
+    "darkstores": "dark stores",
+    "crashedsaucer": "crashed saucer",
+    "soulgrinder": "soul grinder",
+    "unexpectedparcel": "unexpected parcel",
+}
+
+
+def display_family(family: str) -> str:
+    """Model-facing form of a canonical station family ('supply cupboard')."""
+    canon = normalize_item_name(family)
+    return STATION_DISPLAY_NAMES.get(canon, canon)
+
+
+def canonical_family(name: str) -> str:
+    """Canonical form of any station reference ('supply cupboard' or
+    'SupplyCupboard' -> 'supplycupboard'). All tool-arg intake funnels
+    through here so spaced and compact forms resolve identically."""
+    return normalize_item_name(name)
 
 
 def item_name_matches(item_id: str, craving_or_name: str) -> bool:

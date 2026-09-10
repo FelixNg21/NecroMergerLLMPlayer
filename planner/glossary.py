@@ -33,6 +33,8 @@ def _get_paths(knowledge_dir: Path | None = None):
     """Get all JSON file paths for a given knowledge directory."""
     if knowledge_dir is None:
         knowledge_dir = DEFAULT_KNOWLEDGE_DIR
+    else:
+        knowledge_dir = Path(knowledge_dir)  # accept str too (temp dirs in tests)
     return {
         "merge_chains": knowledge_dir / "merge_chains.json",
         "spawn_rates": knowledge_dir / "spawn_rates.json",

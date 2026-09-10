@@ -235,18 +235,22 @@ def write(path: Path, learnings: list[Learning]) -> None:
 
 
 
-def read_learnings(path: Path = DEFAULT_PATH,
-                   max_learnings: int = MAX_LEARNINGS) -> str:
-    """Prompt text for the most recent learnings, split committed/tentative with type tags."""
-    items = read(path)[-max_learnings:]
+def format_learnings(learnings: list["Learning"],
+                     max_learnings: int = MAX_LEARNINGS) -> str:
+    """Prompt text for the most recent learnings, split committed/tentative with type tags.
+
+    Pure formatter shared by the file backend (`read_learnings`) and the
+    SQLite backend — prompt text is behavior, so both must render identically.
+    """
+    items = learnings[-max_learnings:]
     if not items:
         return ""
-    
+
     # Group by type for better prompt organization
     by_type = {t: [] for t in LEARNING_TYPES}
     for l in items:
         by_type.setdefault(l.type, []).append(l)
-    
+
     parts = []
     for t in LEARNING_TYPES:
         committed = [f"- [{t}] {l.text}" for l in by_type[t] if l.committed]
@@ -256,6 +260,12 @@ def read_learnings(path: Path = DEFAULT_PATH,
         if candidates:
             parts.append(f"Tentative {t} learnings (treat as tentative):\n" + "\n".join(candidates))
     return "\n\n".join(parts)
+
+
+def read_learnings(path: Path = DEFAULT_PATH,
+                   max_learnings: int = MAX_LEARNINGS) -> str:
+    """Prompt text for the most recent learnings, split committed/tentative with type tags."""
+    return format_learnings(read(path), max_learnings)
 
 
 def append_learning(path: Path, texts, title: str | None = None) -> int:
